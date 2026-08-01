@@ -174,10 +174,18 @@ class ReconstructionConfig(_Base):
 
 class EvaluationConfig(_Base):
     downstream_model: str = "llama3.2:3b"
+    host: str = "http://localhost:11434"
+    #: Ollama defaults to a 2048-token window and SILENTLY TRUNCATES beyond it.
+    #: Every "original context" measurement would be a lie without this.
+    num_ctx: int = 16384
+    max_answer_tokens: int = 120
+    timeout_s: float = 300.0
     judge_provider: str = "auto"
     judge_model_openai: str = "gpt-4o-mini"
     judge_model_local: str = "qwen2.5:7b-instruct"
     repeats: int = 1
+    #: Model whose published pricing is used for the cost columns.
+    pricing_model: str = "gpt-4o-mini"
 
 
 class ModelPrice(_Base):

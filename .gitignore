@@ -13,3 +13,8 @@ tiktoken_cache/
 reports/*.json
 reports/*.csv
 !reports/.gitkeep
+# ...except the shipped benchmark. /evaluate serves this to populate the hero
+# metrics instantly; without it in the image the deployed dashboard has no
+# accuracy, cost or latency numbers at all.
+!reports/latest.json
+!reports/latest.csv

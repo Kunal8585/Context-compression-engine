@@ -1,0 +1,130 @@
+{
+  "name": "default",
+  "description": "Question-answering over the sample corpus, used to measure how much downstream answer accuracy survives compression. Contexts are shared between items so each is compressed once per run.",
+  "contexts": {
+    "log_incident": {
+      "source": "logs/checkout_service.log",
+      "lines": [900, 1260],
+      "description": "The incident window of the checkout service log. A slice rather than the full 107k-token file because the A/B test requires the *uncompressed* context to fit the downstream model's window - the full file does not. Compression ratio on the whole file is reported separately."
+    },
+    "postmortem": {
+      "source": "docs/incident_postmortem.md",
+      "description": "Full incident postmortem. Prose with almost no redundancy - the hardest case for a compressor."
+    },
+    "auth_code": {
+      "source": "code/auth_service.py",
+      "description": "Authentication service source. Tests whether compressed code stays answerable."
+    },
+    "tickets": {
+      "source": "support/tickets.txt",
+      "description": "Customer support tickets, heavily duplicated in meaning but not in wording."
+    }
+  },
+  "items": [
+    {
+      "id": "log-01",
+      "context": "log_incident",
+      "question": "Which configuration value caused the incident, and what value was it resolved to?",
+      "expected_answer": "PAYMENT_POOL_SIZE was resolved to 8, because the deployment manifest override was absent.",
+      "key_facts": ["PAYMENT_POOL_SIZE", "8"]
+    },
+    {
+      "id": "log-02",
+      "context": "log_incident",
+      "question": "What exception type was raised in the charge path, and against which host?",
+      "expected_answer": "requests.exceptions.ReadTimeout against payments.internal.",
+      "key_facts": [["ReadTimeout", "Read timed out"], "payments.internal"]
+    },
+    {
+      "id": "log-03",
+      "context": "log_incident",
+      "question": "How long did gateway calls wait before timing out?",
+      "expected_answer": "8000 ms (8 seconds).",
+      "key_facts": [["8000ms", "8000 ms", "8000"]]
+    },
+    {
+      "id": "log-04",
+      "context": "log_incident",
+      "question": "Which version was the rollback target?",
+      "expected_answer": "v2.30.4",
+      "key_facts": [["v2.30.4", "2.30.4"]]
+    },
+    {
+      "id": "log-05",
+      "context": "log_incident",
+      "question": "What was the recorded connection pool wait time, and what were the pool's in-use and size values when it was exceeded?",
+      "expected_answer": "wait_ms 7912 with in_use 8 and size 8.",
+      "key_facts": ["7912", "8"]
+    },
+    {
+      "id": "doc-01",
+      "context": "postmortem",
+      "question": "What did p99 latency for POST /v1/checkout rise from, and to what?",
+      "expected_answer": "From 240 ms to 8.4 s.",
+      "key_facts": [["240 ms", "240ms", "240"], ["8.4 s", "8.4s", "8.4"]]
+    },
+    {
+      "id": "doc-02",
+      "context": "postmortem",
+      "question": "How many checkout attempts were affected and what was the estimated revenue impact?",
+      "expected_answer": "About 14,200 attempts were affected, with an estimated $86,000 revenue impact.",
+      "key_facts": [["14,200", "14200"], ["86,000", "86000"]]
+    },
+    {
+      "id": "doc-03",
+      "context": "postmortem",
+      "question": "Why were no duplicate charges issued to customers during the incident?",
+      "expected_answer": "The payment client uses idempotency keys on every charge request.",
+      "key_facts": [["idempotency", "idempotent"]]
+    },
+    {
+      "id": "doc-04",
+      "context": "postmortem",
+      "question": "What is action item A-1 and which team owns it?",
+      "expected_answer": "Add an alert on pool_wait_ms p99 above 500 ms, owned by Platform.",
+      "key_facts": ["pool_wait_ms", "500", "Platform"]
+    },
+    {
+      "id": "code-01",
+      "context": "auth_code",
+      "question": "What algorithm and iteration count are used to hash passwords?",
+      "expected_answer": "PBKDF2-HMAC-SHA256 with 600,000 iterations.",
+      "key_facts": [["PBKDF2", "pbkdf2"], ["600,000", "600000", "600_000"]]
+    },
+    {
+      "id": "code-02",
+      "context": "auth_code",
+      "question": "How long is an access token valid for, in seconds?",
+      "expected_answer": "900 seconds (15 minutes).",
+      "key_facts": [["900", "15 minute", "15 min"]]
+    },
+    {
+      "id": "code-03",
+      "context": "auth_code",
+      "question": "What is the maximum length allowed for a password, and how does it differ from the username limit?",
+      "expected_answer": "Passwords may be at most 128 characters; usernames at most 64.",
+      "key_facts": ["128", "64"]
+    },
+    {
+      "id": "code-04",
+      "context": "auth_code",
+      "question": "How many failed login attempts trigger a lockout, and how long does the lockout window last?",
+      "expected_answer": "5 failed attempts, with a 300 second lockout window.",
+      "key_facts": ["5", "300"]
+    },
+    {
+      "id": "tickets-01",
+      "context": "tickets",
+      "question": "How many customers reported being charged twice, and for which order IDs?",
+      "expected_answer": "Two customers, for orders ORD-551884 and ORD-552088.",
+      "key_facts": [["ORD-551884", "551884"], ["ORD-552088", "552088"]]
+    },
+    {
+      "id": "tickets-02",
+      "context": "tickets",
+      "question": "What was the most frequently reported problem across these tickets?",
+      "expected_answer": "Checkout/payment hanging then failing with an error, without the card being charged.",
+      "key_facts": [["checkout", "payment", "pay"]]
+    }
+  ]
+}

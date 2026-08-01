@@ -1,0 +1,135 @@
+import { useMemo } from "react";
+import type { CompressResponse } from "../types";
+
+/**
+ * Side-by-side original vs compressed.
+ *
+ * The backend never echoes the input back - it returns character spans over the
+ * text we already hold, which is what keeps the response ~70 KB instead of
+ * 2.17 MB on a large log. So the left pane is rendered by slicing our own copy
+ * with those spans, dimming everything the selector dropped.
+ */
+export function DiffView({
+  original,
+  result,
+}: {
+  original: string;
+  result: CompressResponse;
+}) {
+  const segments = useMemo(() => {
+    const out: Array<{ text: string; kept: boolean; key: string }> = [];
+    let cursor = 0;
+    result.spans.forEach((span, index) => {
+      if (span.start > cursor) {
+        // Whitespace between chunks - keep it so line numbers stay honest.
+        out.push({
+          text: original.slice(cursor, span.start),
+          kept: true,
+          key: `gap-${index}`,
+        });
+      }
+      out.push({
+        text: original.slice(span.start, span.end),
+        kept: span.kept,
+        key: `span-${index}`,
+      });
+      cursor = Math.max(cursor, span.end);
+    });
+    if (cursor < original.length) {
+      out.push({ text: original.slice(cursor), kept: true, key: "tail" });
+    }
+    return out;
+  }, [original, result.spans]);
+
+  const { summary } = result;
+  const droppedTokens = result.spans
+    .filter((s) => !s.kept)
+    .reduce((total, s) => total + s.tokens, 0);
+
+  return (
+    <section>
+      <div className="mb-3 flex flex-wrap items-baseline gap-x-4 gap-y-1">
+        <h2 className="text-sm font-medium text-neutral-300">Before / after</h2>
+        <span className="font-mono text-xs text-neutral-500">
+          {summary.original_tokens.toLocaleString()} →{" "}
+          {summary.compressed_tokens.toLocaleString()} tokens ·{" "}
+          <span className="text-emerald-400">
+            {summary.compression_pct.toFixed(1)}% smaller
+          </span>{" "}
+          · budget {summary.budget_tokens.toLocaleString()} ·{" "}
+          {summary.total_ms.toFixed(0)}ms
+        </span>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Pane
+          title="Original"
+          meta={`${summary.chunks_total} chunks · ${summary.original_tokens.toLocaleString()} tokens`}
+        >
+          {segments.map((segment) =>
+            segment.kept ? (
+              <span key={segment.key}>{segment.text}</span>
+            ) : (
+              <span
+                key={segment.key}
+                title="dropped by the budget selector"
+                className="bg-red-950/30 text-neutral-600 line-through decoration-neutral-700"
+              >
+                {segment.text}
+              </span>
+            ),
+          )}
+        </Pane>
+
+        <Pane
+          title="Compressed"
+          meta={`${summary.chunks_kept} of ${summary.chunks_total} chunks kept · ${summary.compressed_tokens.toLocaleString()} tokens`}
+        >
+          {/* Audit markers the reconstructor inserted are highlighted so it is
+              obvious the prompt declares its own omissions. */}
+          {result.compressed_text.split(/(\[[^\]\n]*\])/g).map((part, index) =>
+            part.startsWith("[") && part.endsWith("]") ? (
+              <span
+                key={index}
+                className="text-amber-500/80 bg-amber-950/20 rounded px-0.5"
+              >
+                {part}
+              </span>
+            ) : (
+              <span key={index}>{part}</span>
+            ),
+          )}
+        </Pane>
+      </div>
+
+      <p className="mt-2 text-xs text-neutral-600">
+        <span className="inline-block h-2 w-3 bg-red-950/60 align-middle" />{" "}
+        dropped ({droppedTokens.toLocaleString()} tokens) ·{" "}
+        <span className="text-amber-500/80">[markers]</span> state what was
+        removed, so the prompt is auditable
+      </p>
+    </section>
+  );
+}
+
+function Pane({
+  title,
+  meta,
+  children,
+}: {
+  title: string;
+  meta: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-950">
+      <div className="flex items-baseline justify-between border-b border-neutral-800 px-3 py-2">
+        <span className="text-xs font-medium text-neutral-300">{title}</span>
+        <span className="font-mono text-[11px] text-neutral-600">{meta}</span>
+      </div>
+      <pre className="max-h-[26rem] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-neutral-400">
+        {children}
+      </pre>
+    </div>
+  );
+}

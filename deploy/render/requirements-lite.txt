@@ -1,0 +1,31 @@
+# Hosted backend dependencies - LITE (no torch).
+#
+# Deliberately smaller than the project's requirements.txt: torch is installed
+# separately from the CPU index (see Dockerfile), and everything only the local
+# demo needs - the Ollama client, the OpenAI diagnostic, pytest - is omitted.
+
+# --- core engine ---
+tiktoken==0.13.0
+tree-sitter==0.26.0
+tree-sitter-python==0.25.0
+tree-sitter-javascript==0.25.0
+pyyaml==6.0.3
+pydantic==2.13.4
+numpy==2.5.1
+
+# --- density (no torch) ---
+# sentence-transformers is deliberately absent. The engine detects this and
+# reports it via /health; stage 3's embedding pass and stage 4's novelty signal
+# report "unavailable" and their weight is redistributed. Costs 11.6 points of
+# fact survival (80.8% -> 69.2%), measured - not guessed.
+scikit-learn==1.9.0
+spacy==3.8.14
+
+# --- api ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+python-multipart==0.0.32
+
+# `requests` is still needed: the Ollama client is imported at startup and must
+# be able to report "unavailable" cleanly rather than raise on import.
+requests==2.34.2

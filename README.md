@@ -5,9 +5,9 @@ service logs, long documents) by **70%+** before it ever reaches an LLM, while
 preserving the reasoning-critical content. Everything runs locally on an
 Apple Silicon MacBook - no cloud GPU, no paid API key required.
 
-> **Status: stages 1-5 and 7 complete.** The full compression path -
-> chunk, dedup, score, select, reconstruct - runs end to end and is tested
-> (182 tests). Stage 6 (abstractive) and 8-11 are next; see
+> **Status: stages 1-9 complete.** The compression pipeline, evaluation
+> harness and FastAPI backend all run end to end and are tested (224 tests).
+> The React dashboard and deployment remain; see
 > [Build status](#build-status).
 
 ---
@@ -87,8 +87,13 @@ Compressed prompt ──► Evaluation harness ──► FastAPI ──► Strea
 │       ├── text.py              # paragraph/sentence, markdown-aware
 │       ├── logs.py              # log records + template extraction
 │       └── _spans.py            # span primitives, offset maps, sentence splitting
-├── eval/                        # stage 8 - evaluation harness            (pending)
-├── backend/                     # stage 9 - FastAPI                       (pending)
+├── eval/
+│   ├── harness.py               # stage 8 - runs original vs compressed, writes reports/
+│   ├── testset.py               # loads + validates the 15-item test set
+│   └── scoring.py               # deterministic key-fact recall (+ optional judge)
+├── backend/main.py              # stage 9 - FastAPI: /compress /evaluate /health /config
+├── run.sh                       # one-command local run
+├── docs/API_CONTRACT.md         # the frontend contract
 ├── frontend/                    # React + TS + Tailwind dashboard         (pending)
 ├── data/sample_corpus/
 │   ├── code/auth_service.py     # 240 lines, deliberate near-duplicate validators
@@ -197,6 +202,73 @@ After stages 2→3→4 on `checkout_service.log`, the ranking is:
 | 12 | `WARN connection pool wait exceeded threshold` |
 | 14 | `INFO rollback initiated` — the fix |
 | …143–146 | `DEBUG emitted metric checkout.latency` — routine telemetry |
+
+---
+
+## Measured results
+
+Produced by `python -m eval.harness` on a 15-item question-answering set,
+llama3.2:3b at `num_ctx` 16,384, on an M2. Regenerate with the same command;
+the report lands in `reports/latest.json` and `.csv`.
+
+| Judged metric | Result | Target |
+|---|---|---|
+| Compression ratio | **71.5%** (88,664 → 25,317 tokens) | 70% ✅ |
+| Cost reduction | **70.9%** ($0.01361 → $0.00396) | ✅ |
+| Latency speedup | **4.05×** (640.7s → 158.1s) | ✅ |
+| Accuracy retention | **63.0%** (90.0% → 56.7%) | 95% ❌ |
+
+Cost uses published gpt-4o-mini per-token pricing from `config.yaml` applied to
+measured token counts — local inference is free, so the dollar figure answers
+"what would this prompt cost against a hosted API", which is the number that
+transfers off this laptop. Latency is wall-clock on this hardware and does not.
+
+### Why retention is 63% and not 95%
+
+The number decomposes, and the two halves have different owners:
+
+| | Measured |
+|---|---|
+| Key facts surviving compression | **80.8%** — the compressor's own ceiling |
+| Facts the model retrieved from the compressed context | 56.7% |
+| Facts the model retrieved from the **full original** | 90.0% — imperfect either way |
+
+Of the 5 degraded items, **4 had the required fact verifiably present in the
+compressed text and the model still answered "NOT FOUND."** For `log-02`, both
+`ReadTimeout` and `payments.internal` are in the compressed context. So the
+dominant remaining gap is small-model *retrieval*, not information destroyed by
+compression.
+
+One hypothesis was tested and rejected: that the `[... omitted ...]` markers
+were priming the model toward NOT FOUND. Re-running the failures with markers
+disabled changed nothing (12% both ways).
+
+### Compression and retention trade off by input type
+
+Fact survival through compression, measured without any model calls:
+
+| Budget | Overall | Logs | Postmortem | Code | Tickets |
+|---|---|---|---|---|---|
+| 15% | 61.5% | 8/8 | 3/8 | 2/7 | 1/3 |
+| 30% | **80.8%** | **8/8** | 5/8 | 6/7 | 2/3 |
+| 50% | 84.6% | 8/8 | 5/8 | 7/7 | 2/3 |
+
+Redundant input compresses essentially for free — the 107k-token log holds
+**8/8 facts at every budget including 15%**. Fact-dense prose with no
+redundancy has a real ceiling: there is no way to remove 70% of a document
+where every paragraph states different facts and keep them all. That is a
+property of the input, not a defect in the compressor, and the harness
+quantifies it rather than averaging it away.
+
+### Stage 6 (abstractive) is built, safe, and switched off in practice
+
+Measured on this corpus: **3–6s per chunk and 0 tokens saved.** The one
+paraphrase attempted was correctly rejected for dropping `10:41` from the
+incident timeline. The mechanism does work — a verbose prose chunk compressed
+188 → 111 tokens at 100% critical-token retention — but stage 5 drops exactly
+those verbose chunks first, so little of what survives selection is safely
+compressible. `fast_mode: true` is the recommended live path: 20× faster for
+identical output.
 
 ---
 
@@ -319,12 +391,12 @@ deviation from the original stack list.
 | 3 | Redundancy detector | done |
 | 4 | Density scorer | done |
 | 5 | Budget-constrained selector | done |
-| 6 | Abstractive compressor (Ollama) | pending |
+| 6 | Abstractive compressor (Ollama) | done (measured: 0 tokens saved - see below) |
 | 7 | Reconstruction + drop markers | done |
-| 8 | Evaluation harness | pending |
-| 9 | FastAPI backend | pending |
+| 8 | Evaluation harness | done |
+| 9 | FastAPI backend | done |
 | 10 | React dashboard | pending |
-| 11 | Deployment + `run.sh` | pending |
+| 11 | Deployment + `run.sh` | `run.sh` done; deploy pending |
 
 ## Tests
 

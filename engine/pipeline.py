@@ -287,7 +287,10 @@ class CompressionPipeline:
         reconstruction = None
         attempts = 0
 
-        for attempts in range(1, 5):
+        protected_kinds = set(self.cfg.selection.protected_kinds)
+        previous_used: int | None = None
+
+        for attempts in range(1, 7):
             candidate = self.selector.run(
                 redundancy.chunks,
                 original_tokens=original_tokens,
@@ -310,7 +313,23 @@ class CompressionPipeline:
 
             if final_tokens <= target_tokens:
                 break
-            allowance -= (final_tokens - target_tokens) + 1
+
+            if candidate.used_tokens == previous_used:
+                # Granularity stall: chunks are 14-233 tokens, so trimming the
+                # allowance by a 2-token overshoot never crosses a chunk
+                # boundary and the loop spins on an identical selection. Drop
+                # the allowance below the smallest kept chunk to force progress.
+                droppable = [
+                    c.token_count
+                    for c in candidate.kept
+                    if c.kind not in protected_kinds
+                ]
+                if not droppable:
+                    break
+                allowance = candidate.used_tokens - min(droppable)
+            else:
+                allowance -= (final_tokens - target_tokens) + 1
+            previous_used = candidate.used_tokens
             if allowance < 1:
                 break
 

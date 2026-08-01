@@ -1,0 +1,20 @@
+# Render blueprint. Deploy with: https://render.com/deploy (or New > Blueprint)
+#
+# `plan` is deliberately `starter`, not `free`: the free tier is 0.1 vCPU, and
+# MiniLM encoding on a tenth of a core makes every request feel broken. If you
+# must use free, set plan: free AND dockerfileArgs BUILD=lite below - the lite
+# build does no neural encoding at all.
+services:
+  - type: web
+    name: cce-api
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: CCE_FORCE_FAST_MODE
+        value: "1"
+      # Uncomment for the free tier:
+      # - key: DOCKER_BUILD_ARG_BUILD
+      #   value: lite

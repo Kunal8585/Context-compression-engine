@@ -87,7 +87,9 @@ density:
   # not worth ranking on.
   frequency_boost: 0.05
 
-  # Structural prior per chunk kind, in [0, 1].
+  # Structural prior per chunk kind, on an absolute [0, 1] scale. Unlike the
+  # other four signals this one is NOT rescaled before weighting - see
+  # density.py for why normalising a low-cardinality designed scale broke it.
   structure_priors:
     query: 1.0
     instruction: 1.0
@@ -101,7 +103,9 @@ density:
     list: 0.50
     heading: 0.50
     log_record: 0.40
-    module_level: 0.40
+    # Constants and configuration blocks are pure fact (ACCESS_TOKEN_TTL_SECONDS
+    # = 900, MAX_FAILED_ATTEMPTS = 5) and are exactly what questions ask about.
+    module_level: 0.60
     sentence: 0.40
     other: 0.30
     default: 0.40
@@ -211,8 +215,23 @@ reconstruction:
 
 evaluation:
   downstream_model: llama3.2:3b
+  host: http://localhost:11434
+  # Ollama defaults to a 2048-token context and silently truncates past it -
+  # which would make every "original context" measurement fiction. Set high
+  # enough to hold the largest uncompressed eval context (14.5k tokens).
+  num_ctx: 16384
+  max_answer_tokens: 120
+  timeout_s: 300
+  # Cost is computed from this model's published per-token price. Local
+  # inference is free; the dollar figure answers "what would this prompt cost
+  # against a hosted API", which is the number that transfers.
+  pricing_model: gpt-4o-mini
   judge_provider: auto      # auto | openai | ollama | exact
   judge_model_openai: gpt-4o-mini
+  # Optional independent judge. NOT installed by default - a 7B pull was
+  # abandoned as not worth the hours near the deadline. Without it the harness
+  # uses deterministic key-fact recall only, which is the headline metric
+  # anyway; the judge is a second opinion, never the score.
   judge_model_local: qwen2.5:7b-instruct
   repeats: 1
 

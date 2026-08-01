@@ -196,7 +196,22 @@ class DensityScorer:
 
         # --- combine ---
         weights = self._effective_weights(unavailable)
-        normalised = {name: _normalise(values) for name, values in raw.items()}
+        # `structure` is deliberately NOT normalised. The other four signals are
+        # unbounded and relative, so they need scaling to be comparable. The
+        # structural prior is already an absolute, hand-designed [0, 1] scale -
+        # and it is low-cardinality (a code file has ~3 distinct values). Running
+        # percentile min-max over 3 values re-binarises it: with priors of
+        # 0.60/0.65/0.70, everything at or below the 5th percentile collapses to
+        # 0.0, so a block of pure constants scored 0.00 on structure while
+        # scoring 1.00 on both entropy and entity density, and ranked 18/22.
+        # Raising the prior did nothing, because normalisation just rescaled the
+        # new value back to zero.
+        normalised = {
+            name: (
+                np.clip(values, 0.0, 1.0) if name == "structure" else _normalise(values)
+            )
+            for name, values in raw.items()
+        }
         frequency = self._frequency(chunks)
         boost = self.cfg.density.frequency_boost
 
