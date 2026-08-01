@@ -1,0 +1,231 @@
+# ---------------------------------------------------------------------------
+# Ultra-Low Resource Context Compression Engine - single source of truth.
+#
+# Every threshold, weight and budget used by the pipeline lives here. No stage
+# is allowed to hardcode a tunable. Override the path with $CCE_CONFIG.
+# ---------------------------------------------------------------------------
+
+tokenizer:
+  # tiktoken encoding used for every token count reported by the engine.
+  # cl100k_base is the GPT-4o / GPT-4 / GPT-3.5 encoding.
+  encoding: cl100k_base
+  # Used only if tiktoken cannot load its BPE file (fully offline first run).
+  # Counts then become estimates and are flagged as such in every report.
+  fallback_tokens_per_word: 1.3
+
+chunking:
+  # Preferred size of a chunk. The chunker will not split a semantic unit
+  # (a function, a log record) just to hit this - it is a packing target.
+  target_chunk_tokens: 120
+  # Hard ceiling. Units above this are split (class -> methods, paragraph ->
+  # sentence groups) so that one huge blob cannot dominate the token budget.
+  max_chunk_tokens: 400
+  # Chunks below this are candidates for merging with their neighbour.
+  min_chunk_tokens: 12
+  merge_small_chunks: true
+  # Only these kinds may be merged with a neighbour. Functions/classes/log
+  # records are never merged - keeping them atomic is what makes dedup and
+  # density scoring meaningful downstream.
+  # A bare `## Root Cause` heading is not worth its own chunk - merging it into
+  # the paragraph below keeps the section name attached to the prose it labels.
+  mergeable_kinds: [module_level, paragraph, sentence, heading, list, other]
+  # Pull comments/docstrings immediately above a definition into its chunk.
+  attach_leading_comments: true
+  # If a source file's parse tree is more than this fraction errors, fall back
+  # to the text chunker instead of emitting garbage chunks.
+  max_parse_error_ratio: 0.30
+
+redundancy:
+  enabled: true
+  model: sentence-transformers/all-MiniLM-L6-v2
+  # Cosine similarity at or above this merges two chunks into one cluster.
+  similarity_threshold: 0.88
+  # Byte-identical (post-normalisation) chunks are collapsed without needing
+  # the embedding model - cheap and works even if sentence-transformers fails.
+  exact_hash_dedup: true
+
+  # Structural dedup for code. MiniLM is trained on prose and scores
+  # near-identical functions at only 0.62-0.77 cosine, so embeddings alone do
+  # nothing for source files. This collapses chunks with an identical token
+  # *shape* (identifiers and strings blanked; keywords, operators and NUMBERS
+  # preserved, so a 64-char limit never merges with a 128-char one).
+  structural:
+    enabled: true
+    # Below this size there is not enough structure to tell chunks apart
+    # (four one-line exception classes all share one shape) and almost no
+    # budget to win. Raise it to be more conservative.
+    min_tokens: 30
+    kinds: [function, method, class]
+
+  batch_size: 64
+  device: auto            # auto | cpu | mps
+
+density:
+  # Weighted sum of the five signals. Must be tuned here, never in code.
+  #
+  # Calibrated against known-critical content, not guessed: with the original
+  # 0.25/0.25/0.25/0.15/0.10 split, routine INFO cache-hit lines took the top 4
+  # ranks while the stack trace fell to 90/146 and the root-cause WARN to
+  # 78/146. Rarity (tfidf, novelty) and severity (structure) predict "this
+  # answers a question about the incident"; raw entity counts do not.
+  weights:
+    entropy: 0.15         # token-level Shannon entropy - detects repetitive filler
+    tfidf: 0.25           # rarity of the chunk's terms across the document
+    entities: 0.15        # named entities, numbers, identifiers, signatures
+    novelty: 0.20         # distance from the corpus centroid (see density.py)
+    structure: 0.25       # severity, failure vocabulary, signatures, headings
+  spacy_model: en_core_web_sm
+  # Above this many characters, skip spaCy and use the regex entity proxies -
+  # loading NER for 400k chars of log text is not worth the wall-clock. The
+  # stage reports which backend actually ran.
+  spacy_max_chars: 400000
+
+  # A stage-3 representative stands in for every record it absorbed, so it
+  # carries aggregate information a singleton does not. Kept deliberately small:
+  # at 0.15 a routine INFO line seen 34 times scored 0.97 on this signal alone
+  # and outranked every ERROR in the file. Frequency is worth acknowledging,
+  # not worth ranking on.
+  frequency_boost: 0.05
+
+  # Structural prior per chunk kind, in [0, 1].
+  structure_priors:
+    query: 1.0
+    instruction: 1.0
+    system: 1.0
+    function: 0.70
+    method: 0.70
+    class: 0.70
+    class_header: 0.60
+    code_block: 0.60
+    paragraph: 0.50
+    list: 0.50
+    heading: 0.50
+    log_record: 0.40
+    module_level: 0.40
+    sentence: 0.40
+    other: 0.30
+    default: 0.40
+
+  # When stage 2 detected a log severity it overrides the per-kind prior.
+  level_priors:
+    CRITICAL: 1.0
+    FATAL: 1.0
+    SEVERE: 1.0
+    ERROR: 0.95
+    WARNING: 0.80
+    WARN: 0.80
+    NOTICE: 0.50
+    INFO: 0.35
+    DEBUG: 0.20
+    TRACE: 0.15
+
+  # Chunk length at which the entropy estimate is trusted in full. Below it the
+  # score is damped: in 14 tokens nearly every token is distinct, so normalised
+  # entropy pins to 1.0 on content alone and ranked trivial stubs top.
+  entropy_reference_tokens: 64
+
+  # Failure vocabulary bumps the structural prior - these are the lines a
+  # question about an incident is actually about.
+  keyword_boost: 0.25
+  # ...but not in source code, where "exception" and "failure" are type names
+  # and docstrings rather than events.
+  keyword_boost_excluded_kinds: [function, method, class, class_header, module_level]
+  keywords:
+    - traceback
+    - exception
+    - stacktrace
+    - caused by
+    - panic
+    - timeout
+    - timed out
+    - failed
+    - failure
+    - refused
+    - denied
+    - exhausted
+    - corrupt
+    - deadlock
+    - root cause
+    - regression
+    - rollback
+    - outage
+    - incident
+    - breach
+    - data loss
+
+selection:
+  # Token budget as a fraction of the original context. 0.30 -> 70% smaller.
+  budget_ratio: 0.30
+  # Chunks matching these kinds are never dropped (the user's actual question,
+  # explicit instructions, system prompt).
+  protected_kinds: [query, instruction, system]
+  min_chunks_kept: 1
+
+  # At an aggressive budget the greedy pass will keep a function whose
+  # definition it just dropped. Leftover budget is spent re-admitting those
+  # definitions, most-referenced first.
+  # Repair makes room by evicting lower-value chunks rather than reserving a
+  # fixed slice up front - a percentage reserve is arbitrary, and was routinely
+  # smaller than the definition it needed to admit.
+  preserve_code_dependencies: true
+  # Held back for the drop markers stage 7 inserts, so the reconstructed prompt
+  # lands under budget rather than just over it.
+  marker_reserve: 0.03
+
+abstractive:
+  # Stage 6 is strictly optional. If Ollama is not running the pipeline logs a
+  # skip and continues - it must never break a live demo.
+  #
+  # MEASURED on this corpus (llama3.2:3b, M2): 3-6 s per chunk, and on the
+  # postmortem it saved 0 tokens - the one paraphrase attempted was correctly
+  # rejected for dropping a timeline entry (10:41). The mechanism does work
+  # (a verbose prose chunk compressed 188 -> 111 tokens at 100% critical-token
+  # retention) but stage 5 drops exactly those verbose chunks first, so little
+  # of what survives selection is safely compressible. Use `fast_mode: true`
+  # for the live judge path; see README.
+  enabled: true
+  provider: ollama
+  model: llama3.2:3b
+  host: http://localhost:11434
+  # Only paraphrase chunks above this size; below it the LLM call costs more
+  # tokens than it saves.
+  min_tokens_to_compress: 150
+  target_ratio: 0.55
+  # Per-call timeout; a slow paraphrase is abandoned, not waited on.
+  timeout_s: 10
+  # Whole-stage ceiling. Bounded hard so stage 6 can never dominate a live
+  # /compress call - at 3-6 s per chunk, an unbounded stage would take minutes.
+  total_timeout_s: 12
+  max_chunks: 12
+  temperature: 0.0
+  # A paraphrase must retain this fraction of the original's critical tokens
+  # (identifiers, error codes, versions, numbers) or it is discarded.
+  entity_overlap_threshold: 0.90
+  # Numbers are never negotiable: 64 must not become 128.
+  require_numbers_preserved: true
+
+reconstruction:
+  # Emit an auditable marker wherever content was dropped or collapsed.
+  drop_markers: true
+  cluster_markers: true
+
+evaluation:
+  downstream_model: llama3.2:3b
+  judge_provider: auto      # auto | openai | ollama | exact
+  judge_model_openai: gpt-4o-mini
+  judge_model_local: qwen2.5:7b-instruct
+  repeats: 1
+
+# Published per-1M-token prices (USD) used for the cost columns. Cost is
+# computed, never asserted - change the model and the numbers change.
+pricing:
+  gpt-4o-mini:
+    input_per_1m: 0.15
+    output_per_1m: 0.60
+  gpt-4o:
+    input_per_1m: 2.50
+    output_per_1m: 10.00
+  claude-sonnet-4-5:
+    input_per_1m: 3.00
+    output_per_1m: 15.00
+  default_model: gpt-4o-mini

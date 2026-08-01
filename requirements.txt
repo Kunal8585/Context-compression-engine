@@ -1,0 +1,40 @@
+# Ultra-Low Resource LLM Context Compression Engine
+# Pinned to the versions this project was built and tested against on
+# macOS 15 / Apple Silicon (M2), Python 3.12.
+#
+#   uv venv --python 3.12 && uv pip install -r requirements.txt
+#
+# Direct dependencies only; transitive versions are resolved by the installer.
+
+# --- core engine (stages 2-7) ---
+tiktoken==0.13.0                 # exact token counts (cl100k_base)
+tree-sitter==0.26.0              # syntax-aware code chunking
+tree-sitter-python==0.25.0
+tree-sitter-javascript==0.25.0
+pyyaml==6.0.3                    # config.yaml
+pydantic==2.13.4                 # config validation
+numpy==2.5.1
+
+# --- redundancy detection + density scoring (stages 3-4) ---
+sentence-transformers==5.6.1     # all-MiniLM-L6-v2 embeddings
+torch==2.13.0                    # MPS backend on Apple Silicon
+scikit-learn==1.9.0              # clustering, TF-IDF
+spacy==3.8.14                    # NER / entity density
+# The spaCy pipeline itself is a separate download, see scripts/setup.sh:
+#   python -m spacy download en_core_web_sm
+
+# --- local LLM + evaluation (stages 6, 8) ---
+requests==2.34.2                 # Ollama HTTP API
+httpx==0.28.1
+openai==2.52.0                   # optional LLM-as-judge; local fallback exists
+
+# --- API + dashboard (stages 9-10) ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+python-multipart==0.0.32
+streamlit==1.60.0
+plotly==6.9.0
+pandas==3.0.5
+
+# --- dev ---
+pytest==9.1.1
