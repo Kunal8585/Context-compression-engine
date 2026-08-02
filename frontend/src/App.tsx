@@ -10,7 +10,6 @@ import {
 } from "./api";
 import { AnswerRace } from "./components/AnswerRace";
 import { HeroMetrics } from "./components/HeroMetrics";
-import { ConfidenceCard } from "./components/ConfidenceCard";
 import { DiffView } from "./components/DiffView";
 import { MarkerExpander } from "./components/MarkerExpander";
 import { ModelSelect, presetToPins, providerLabel } from "./components/ModelSelect";
@@ -402,9 +401,6 @@ export default function App() {
             <ResolvedProvider record={currentRun} />
             <RunComparison current={currentRun} previous={previousRun} />
             {result.files && <FileResults files={result.files} />}
-            {result.confidence && (
-              <ConfidenceCard confidence={result.confidence} />
-            )}
             <DiffView original={submitted} result={result} />
             <MarkerExpander
               compressionId={result.compression_id}

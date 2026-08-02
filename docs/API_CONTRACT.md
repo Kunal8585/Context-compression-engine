@@ -188,57 +188,6 @@ deliberate — the alternative is special-casing the chunker for uploads, and
 chunk boundaries are load-bearing for dedup and density scoring everywhere
 else. The badge marks where a file *begins*, which is what it is read as.
 
-### Response: `confidence`
-
-Every `/compress` response carries a `confidence` block — how much to trust
-*this* compression, computed from counts measured during the run. **No model is
-called.** It predicts fact survival; it does not guarantee it.
-
-```json
-"confidence": {
-  "score": 0.392,
-  "band": "low",
-  "components": {
-    "number_retention": 0.473,
-    "identifier_retention": 0.667,
-    "density_retention": 0.279,
-    "lossless_share": 0.0,
-    "dependency_integrity": 1.0
-  },
-  "reasons": [
-    "58 of 110 distinct numbers that survived deduplication were dropped by the budget (e.g. 240, 8.4)",
-    "only 28% of the document's density mass survived selection; the budget is forcing out scoring content",
-    "100% of the 1,004 removed tokens were unique content evicted by the budget, not duplicates collapsed - this input has little redundancy to exploit"
-  ],
-  "evidence": { "numbers_original": 110, "numbers_kept": 52, "...": "..." },
-  "method": "Deterministic. Weighted ratios over counts measured during this run; no model involved. Predicts fact survival, does not guarantee it."
-}
-```
-
-Bands: `high` ≥ 0.75, `moderate` ≥ 0.50, else `low`. `unknown` for empty input.
-
-**Retention is measured against the stage-3 survivors, not the raw input.**
-Deduplication is near-lossless — a collapsed cluster keeps its representative
-*and* a count marker — so the volatile timestamps and request ids it removes are
-not losses. Scored against the raw input instead, a 2,400-record log retains
-7.7% of its distinct numbers and the context with *perfect* measured fact
-survival scores lowest of four. Measured against survivors it scores 1.000.
-
-Validated by ranking, not asserted:
-
-```
-python -m engine.confidence --calibrate
-
-context          measured   predicted       band
-  log_incident    100.0%       1.000       high
-  auth_code        85.7%       0.541   moderate
-  tickets          66.7%       0.438        low
-  postmortem       62.5%       0.392        low
-  6/6 concordant pairs
-```
-
-n=4, so this establishes *ordering* only and is not a calibration claim.
-
 ### Response
 
 ```json

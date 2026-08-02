@@ -110,7 +110,6 @@ one provider layer:
 │   ├── inspect_chunks.py        # CLI: verify chunk quality on any file
 │   ├── inspect_redundancy.py    # CLI: audit every collapse decision
 │   ├── inspect_density.py       # CLI: per-signal breakdown behind every score
-│   ├── confidence.py            # measured trust score for one compression
 │   └── chunker/
 │       ├── base.py              # Chunker ABC + shared size/merge post-processing
 │       ├── code.py              # tree-sitter: function/class level
@@ -625,69 +624,6 @@ Same input, one click apart, measured on this machine (postmortem, budget 0.95):
 **2.1× faster, and the stronger model earned compression the local one could
 not.** The dashboard keeps the previous run's card on screen, so switching mode
 and re-running shows the delta rather than replacing it.
-
----
-
-## Confidence score
-
-The eval harness can say "80.8% of key facts survived" only because it has a
-test set with the answers written down. On an arbitrary context a user pastes
-in there is no answer key — which is exactly when they most want to know whether
-to trust the output. So every `/compress` response carries a **confidence
-score**, built only from counts the pipeline already measures. No model is
-called, nothing is estimated by an LLM.
-
-| Component | Weight | What it asks |
-|---|---|---|
-| `number_retention` | 0.40 | Of the numbers that survived dedup, how many survived the budget? |
-| `density_retention` | 0.25 | Token-weighted share of density mass kept |
-| `lossless_share` | 0.20 | Were removed tokens duplicates, or unique content? |
-| `dependency_integrity` | 0.10 | Does kept code still have the definitions it references? |
-| `identifier_retention` | 0.05 | Same as numbers, for `PAYMENT_POOL_SIZE`-style tokens |
-
-**The design decision that matters — and the one the first version got wrong.**
-Retention is measured against the **stage-3 survivors**, not the raw input.
-Deduplication is near-lossless by construction: a collapsed cluster keeps its
-representative *and* a count marker, so the fact of the repetition is preserved.
-Budget eviction, by contrast, deletes content that occurred once.
-
-Scored against the raw input, the 2,400-record log retained **7.7%** of its
-distinct numbers and scored *lowest* of the four sample contexts — despite being
-the one with **100%** measured fact survival. The "lost" numbers were timestamp
-fractions (`00.038`, `00.040`, …) that stage 3 collapses on purpose. The score
-was punishing the pipeline for working correctly. Rank correlation against known
-fact survival was 3/6 concordant pairs: chance.
-
-Measured against survivors instead, the log scores 1.000 and correlation goes to
-**6/6**:
-
-```
-python -m engine.confidence --calibrate
-
-context          measured   predicted       band
-  log_incident    100.0%       1.000       high
-  auth_code        85.7%       0.541   moderate
-  tickets          66.7%       0.438        low
-  postmortem       62.5%       0.392        low
-
-  6/6 concordant pairs
-```
-
-**This is a predictor, not a guarantee, and n=4.** Six pairwise comparisons
-establish *ordering* and nothing more; the weights are reasoned defaults, not
-fitted parameters. What the score does have is a stated failure mode, an
-auditable decomposition, and a correlation figure you can reproduce rather than
-take on trust. `reasons` names specifics — *"58 of 110 numbers that survived
-deduplication were dropped by the budget (e.g. 240, 8.4)"* — because a bare
-`0.39` is not something a user can act on, and *"raise the budget"* is.
-
-The bands say something real about input type: a redundant log compresses 93.9%
-at essentially no cost and scores **high**; a postmortem where every paragraph
-states a different fact cannot lose 70% without losing something, and scores
-**low**. That is a property of the input, and the score reports it rather than
-averaging it away.
-
----
 
 ## The provider layer
 

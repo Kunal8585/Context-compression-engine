@@ -185,17 +185,6 @@ export interface FileStatus {
   pages?: number;
 }
 
-/** Measured trustworthiness of one compression. Deterministic — no model. */
-export interface ConfidenceReport {
-  score: number;
-  band: "high" | "moderate" | "low" | "unknown";
-  components: Record<string, number>;
-  /** What is dragging the score down, naming specifics. */
-  reasons: string[];
-  evidence: Record<string, unknown>;
-  method: string;
-}
-
 /** One omission in the compressed text, addressable via /expand. */
 export interface MarkerRef {
   id: string;
@@ -229,7 +218,6 @@ export interface Expansion {
 
 export interface CompressResponse {
   summary: CompressSummary;
-  confidence: ConfidenceReport | null;
   compression_id: string;
   markers: MarkerRef[];
   stages: Stage[];
@@ -311,7 +299,6 @@ export interface AnswerResponse {
     pricing_model: string;
     full_context_rejected: boolean;
   };
-  confidence: ConfidenceReport | null;
   compressed_text: string;
   note: string;
 }

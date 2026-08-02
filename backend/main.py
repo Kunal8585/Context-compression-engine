@@ -736,7 +736,6 @@ def answer(request: AnswerRequest) -> Any:
             "pricing_model": cfg.evaluation.pricing_model,
             "full_context_rejected": bool(full.get("too_large")),
         },
-        "confidence": compressed.confidence.to_dict() if compressed.confidence else None,
         "compressed_text": compressed.compressed_text,
         "note": (
             "Both arms ran concurrently against the same model and parameters, "

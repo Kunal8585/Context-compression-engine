@@ -20,7 +20,6 @@ from typing import Any
 from .abstractive import AbstractiveCompressor, GenerationClient
 from .chunker import chunk_document, detect_kind
 from .config import Config, get_config
-from .confidence import Confidence, score_compression
 from .providers import (
     build_embedding_chain,
     build_generation_chain,
@@ -72,8 +71,6 @@ class CompressionResult:
     repaired_dependencies: list[dict] = field(default_factory=list)
     tokenizer_exact: bool = True
     total_ms: float = 0.0
-    #: Measured trustworthiness of this compression. See engine/confidence.py.
-    confidence: Confidence | None = None
     #: Execution mode this run used: local | cloud | auto.
     mode: str = "auto"
     #: What each marker in the compressed text hides, addressable by the id
@@ -175,7 +172,6 @@ class CompressionResult:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "summary": self.summary(),
-            "confidence": self.confidence.to_dict() if self.confidence else None,
             "stages": [s.to_dict() for s in self.stages],
             "audit_trail": self.audit_trail,
             "broken_dependencies": self.broken_dependencies,
@@ -471,30 +467,6 @@ class CompressionPipeline:
         result.compressed_text = reconstruction.text
         result.compressed_tokens = reconstruction.metrics.tokens_out
         result.markers = reconstruction.recoverable
-
-        # --- confidence: how much to trust what just came out ---
-        #
-        # Scored against the *reconstructed* text, not the kept chunk list, so
-        # it reflects the artifact that actually ships - drop markers, cluster
-        # annotations and any stage 6 paraphrase included. Costs no model call
-        # and no measurable time; it is a handful of set operations over text
-        # the pipeline is already holding.
-        redundancy_metrics = redundancy.metrics
-        result.confidence = score_compression(
-            source,
-            result.compressed_text,
-            chunks,
-            selection.kept,
-            # Stage 3's output is the baseline for lexical retention: what it
-            # collapsed was redundant by construction, not lost.
-            survivors=redundancy.chunks,
-            tokens_removed_by_redundancy=max(
-                0, redundancy_metrics.tokens_in - redundancy_metrics.tokens_out
-            ),
-            tokens_removed_total=max(0, original_tokens - result.compressed_tokens),
-            broken_dependencies=len(result.broken_dependencies),
-            repaired_dependencies=len(result.repaired_dependencies),
-        )
 
         result.total_ms = (time.perf_counter() - started) * 1000
         return result

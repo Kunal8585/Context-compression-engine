@@ -318,11 +318,6 @@ def test_the_response_discloses_that_the_arms_ran_concurrently(raced):
     assert "eval.harness" in raced["note"]
 
 
-def test_answer_carries_the_confidence_score_for_the_compression(raced):
-    assert raced["confidence"] is not None
-    assert 0.0 <= raced["confidence"]["score"] <= 1.0
-
-
 def test_an_empty_question_is_rejected(client, sample_code):
     response = client.post(
         "/answer", json={"text": sample_code, "question": ""}

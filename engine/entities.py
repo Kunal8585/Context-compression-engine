@@ -22,7 +22,25 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 # --- regex proxies ---------------------------------------------------------
-_NUMBER = re.compile(r"\b\d[\d,._]*\b")
+# A bare number, NOT counting one glued to a unit or embedded in an identifier
+# or version string - those are handled below and would otherwise be counted
+# twice, or half-matched.
+#
+# The previous pattern (`\b\d[\d,._]*\b`) silently lost every measurement:
+# "latency rose from 240ms to 8.4s" matched only `8.` - `240` was invisible
+# because the trailing word boundary failed against the unit. Chunks stating
+# exactly the facts questions ask about therefore scored as ordinary prose,
+# and stage 5 dropped them. Both `240ms` and `8.4s` were among the facts the
+# benchmark measured as lost.
+_NUMBER = re.compile(r"(?<![\w.])\d+(?:,\d{3})*(?:\.\d+)?(?![\w.]*[A-Za-z_])")
+
+# A number with a unit attached. Weighted above a bare digit: "8000ms" is a
+# threshold someone will ask about, "3" on its own usually is not.
+_MEASUREMENT = re.compile(
+    r"(?<![\w.])\d+(?:,\d{3})*(?:\.\d+)?\s?"
+    r"(?:ms|us|ns|s|m|h|d|kb|mb|gb|tb|kib|mib|gib|b|%|x|px|rps|qps|req/s)\b",
+    re.I,
+)
 _SNAKE_CASE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
 _CAMEL_CASE = re.compile(r"\b[a-z]+[A-Z]\w*\b")
 _CONSTANT = re.compile(r"\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)*\b")
@@ -40,6 +58,10 @@ _WEIGHTS = {
     "entities": 2.0,
     "signatures": 3.0,
     "numbers": 1.0,
+    # A measurement is a stronger fact signal than a bare digit - it is the
+    # shape of a threshold, a duration or a limit, which is what an incident
+    # question asks about.
+    "measurements": 2.5,
     "identifiers": 1.0,
     "dotted": 0.75,
     "urls": 1.0,
@@ -52,6 +74,7 @@ class EntityCounts:
     entities: int = 0
     signatures: int = 0
     numbers: int = 0
+    measurements: int = 0
     identifiers: int = 0
     dotted: int = 0
     urls: int = 0
@@ -62,6 +85,7 @@ class EntityCounts:
             _WEIGHTS["entities"] * self.entities
             + _WEIGHTS["signatures"] * self.signatures
             + _WEIGHTS["numbers"] * self.numbers
+            + _WEIGHTS["measurements"] * self.measurements
             + _WEIGHTS["identifiers"] * self.identifiers
             + _WEIGHTS["dotted"] * self.dotted
             + _WEIGHTS["urls"] * self.urls
@@ -73,6 +97,7 @@ class EntityCounts:
             "entities": self.entities,
             "signatures": self.signatures,
             "numbers": self.numbers,
+            "measurements": self.measurements,
             "identifiers": self.identifiers,
             "dotted": self.dotted,
             "urls": self.urls,
@@ -86,6 +111,7 @@ def regex_counts(text: str) -> EntityCounts:
         entities=0,
         signatures=len(_SIGNATURE.findall(text)),
         numbers=len(_NUMBER.findall(text)),
+        measurements=len(_MEASUREMENT.findall(text)),
         identifiers=len(_SNAKE_CASE.findall(text))
         + len(_CAMEL_CASE.findall(text))
         + len(_CONSTANT.findall(text)),

@@ -13,7 +13,6 @@ export interface RunRecord {
   originalTokens: number;
   compressedTokens: number;
   compressionPct: number;
-  confidence: number | null;
 }
 
 export function toRunRecord(
@@ -38,7 +37,6 @@ export function toRunRecord(
     originalTokens: result.summary.original_tokens,
     compressedTokens: result.summary.compressed_tokens,
     compressionPct: result.summary.compression_pct,
-    confidence: result.confidence?.score ?? null,
   };
 }
 
@@ -143,12 +141,8 @@ function RunCard({
         <Metric label="wall" value={`${(record.wallMs / 1000).toFixed(1)}s`} />
         <Metric label="smaller" value={`${record.compressionPct.toFixed(0)}%`} />
         <Metric
-          label="confidence"
-          value={
-            record.confidence === null
-              ? "—"
-              : `${Math.round(record.confidence * 100)}%`
-          }
+          label="tokens"
+          value={record.compressedTokens.toLocaleString()}
         />
       </dl>
     </div>
