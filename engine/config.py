@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -54,6 +54,14 @@ class RedundancyConfig(_Base):
     enabled: bool = True
     model: str = "sentence-transformers/all-MiniLM-L6-v2"
     similarity_threshold: float = 0.88
+    #: Per-provider override. Cosine is not a shared scale across embedding
+    #: models: on the same 26 near-duplicate tickets MiniLM's highest pair
+    #: scores 0.908 while Cohere's tops out at 0.877, so one threshold applied
+    #: to both silently disables fuzzy dedup for the second. Providers absent
+    #: from this map fall back to `similarity_threshold` and the stage says so.
+    similarity_threshold_by_provider: dict[str, float] = Field(
+        default_factory=lambda: {"local": 0.88, "cohere": 0.84}
+    )
     exact_hash_dedup: bool = True
     structural: StructuralDedupConfig = Field(default_factory=StructuralDedupConfig)
     batch_size: int = 64
@@ -66,6 +74,10 @@ class DensityWeights(_Base):
     entities: float = 0.25
     novelty: float = 0.15
     structure: float = 0.10
+    #: Cosine similarity to the user's question. Unavailable - and its weight
+    #: redistributed over the others - whenever no query was supplied, so a
+    #: query-less compression scores exactly as it did before this existed.
+    query_relevance: float = 0.0
 
     def normalised(self) -> dict[str, float]:
         raw = self.model_dump()
@@ -149,10 +161,9 @@ class SelectionConfig(_Base):
 
 
 class AbstractiveConfig(_Base):
+    """Stage 6's own thresholds. *Which* model runs it lives in `providers`."""
+
     enabled: bool = True
-    provider: str = "ollama"
-    model: str = "llama3.2:3b"
-    host: str = "http://localhost:11434"
     min_tokens_to_compress: int = 150
     target_ratio: float = 0.55
     #: Per-call timeout. A slow paraphrase is abandoned, not waited on.
@@ -167,16 +178,105 @@ class AbstractiveConfig(_Base):
     require_numbers_preserved: bool = True
 
 
+class ProviderModelsConfig(_Base):
+    """Model identifier per provider and role. Names only - never keys."""
+
+    openai_embedding: str = "text-embedding-3-small"
+    #: text-embedding-004 was retired and 404s on :embedContent.
+    gemini_embedding: str = "gemini-embedding-001"
+    cohere_embedding: str = "embed-english-v3.0"
+    local_embedding: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    groq_generation: str = "llama-3.3-70b-versatile"
+    gemini_generation: str = "gemini-2.0-flash"
+    openai_generation: str = "gpt-4o-mini"
+    #: Which OpenRouter models carry the `:free` tag rotates month to month, so
+    #: this is config, and $OPENROUTER_MODEL overrides it at runtime.
+    openrouter_generation: str = "nvidia/nemotron-3-nano-30b-a3b:free"
+    local_generation: str = "llama3.2:3b"
+
+
+class ProvidersConfig(_Base):
+    """Which model backs each stage, and what happens when it cannot.
+
+    This is the block to point at when asked "what is actually running this
+    right now": the chains below are walked in the order written, top to
+    bottom, and ``GET /health`` reports which entry is live.
+    """
+
+    #: Stage 3. openai | gemini | cohere | local
+    embedding_provider: str = "openai"
+    #: Tried in order after ``embedding_provider`` is skipped or fails.
+    embedding_fallback: list[str] = Field(default_factory=lambda: ["gemini", "local"])
+    #: Stage 6 and the eval harness, tried in order.
+    generation_providers: list[str] = Field(
+        default_factory=lambda: ["groq", "gemini", "openai", "local"]
+    )
+    #: Default per-request HTTP timeout; callers may pass a tighter one.
+    timeout_s: float = 30.0
+    #: How long a failed provider sits out before the chain retries it.
+    cooldown_s: float = 60.0
+    local_host: str = "http://localhost:11434"
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def _known_embedding(cls, value: str) -> str:
+        from .providers.embedding import EMBEDDING_PROVIDERS
+
+        if value not in EMBEDDING_PROVIDERS:
+            raise ValueError(
+                f"unknown embedding provider {value!r}; "
+                f"choose from {sorted(EMBEDDING_PROVIDERS)}"
+            )
+        return value
+
+    @field_validator("embedding_fallback")
+    @classmethod
+    def _known_embedding_chain(cls, value: list[str]) -> list[str]:
+        from .providers.embedding import EMBEDDING_PROVIDERS
+
+        unknown = [name for name in value if name not in EMBEDDING_PROVIDERS]
+        if unknown:
+            raise ValueError(
+                f"unknown embedding provider(s) {unknown}; "
+                f"choose from {sorted(EMBEDDING_PROVIDERS)}"
+            )
+        return value
+
+    @field_validator("generation_providers")
+    @classmethod
+    def _known_generation(cls, value: list[str]) -> list[str]:
+        from .providers.generation import GENERATION_PROVIDERS
+
+        unknown = [name for name in value if name not in GENERATION_PROVIDERS]
+        if unknown:
+            raise ValueError(
+                f"unknown generation provider(s) {unknown}; "
+                f"choose from {sorted(GENERATION_PROVIDERS)}"
+            )
+        if not value:
+            raise ValueError("generation_providers must name at least one provider")
+        return value
+
+    models: ProviderModelsConfig = Field(default_factory=ProviderModelsConfig)
+
+
 class ReconstructionConfig(_Base):
     drop_markers: bool = True
     cluster_markers: bool = True
 
 
 class EvaluationConfig(_Base):
-    downstream_model: str = "llama3.2:3b"
-    host: str = "http://localhost:11434"
+    """How the harness measures. *Which* model answers lives in `providers`.
+
+    The harness asks its questions through the same generation chain stage 6
+    uses, so there is one answer to "what model produced these numbers" and the
+    report records whichever provider actually served the run.
+    """
+
     #: Ollama defaults to a 2048-token window and SILENTLY TRUNCATES beyond it.
-    #: Every "original context" measurement would be a lie without this.
+    #: Every "original context" measurement would be a lie without this. Only
+    #: applies to the local provider; hosted models have their own windows.
     num_ctx: int = 16384
     max_answer_tokens: int = 120
     timeout_s: float = 300.0
@@ -219,6 +319,7 @@ class Config(_Base):
     redundancy: RedundancyConfig = Field(default_factory=RedundancyConfig)
     density: DensityConfig = Field(default_factory=DensityConfig)
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     abstractive: AbstractiveConfig = Field(default_factory=AbstractiveConfig)
     reconstruction: ReconstructionConfig = Field(default_factory=ReconstructionConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)

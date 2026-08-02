@@ -40,11 +40,15 @@ class ReconstructionResult:
     metrics: StageMetrics = field(default_factory=lambda: StageMetrics("reconstruction"))
     marker_count: int = 0
     marker_tokens: int = 0
+    #: What each marker hides, keyed by the id printed inside it. Lets a
+    #: consumer recover a specific omission instead of re-compressing.
+    recoverable: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "metrics": self.metrics.to_dict(),
             "marker_count": self.marker_count,
+            "recoverable": self.recoverable,
             "marker_tokens": self.marker_tokens,
         }
 
@@ -95,16 +99,34 @@ class Reconstructor:
         pieces: list[str] = []
         kinds: list[str] = []
         markers: list[str] = []
+        #: Every marker's recoverable payload, keyed by its id. This is what
+        #: turns a marker from an apology into an address: a consumer that hits
+        #: `[... omitted ... #d3]` and decides it needs that content can ask for
+        #: it back rather than re-running the whole compression at a looser
+        #: budget. Compression with an escape hatch.
+        recoverable: list[dict] = []
         pending_drops: list[Chunk] = []
 
         def flush_drops() -> None:
             if not pending_drops or not settings.drop_markers:
                 pending_drops.clear()
                 return
-            marker = self._drop_marker(pending_drops)
+            marker_id = f"d{len(recoverable)}"
+            marker = self._drop_marker(pending_drops, marker_id)
             pieces.append(marker)
             kinds.append("marker")
             markers.append(marker)
+            recoverable.append({
+                "id": marker_id,
+                "kind": "dropped",
+                "chunk_ids": [c.id for c in pending_drops],
+                "sections": len(pending_drops),
+                "tokens": sum(c.token_count for c in pending_drops),
+                "start_line": pending_drops[0].start_line,
+                "end_line": pending_drops[-1].end_line,
+                "start_char": pending_drops[0].start_char,
+                "end_char": pending_drops[-1].end_char,
+            })
             pending_drops.clear()
 
         for chunk in ordered:
@@ -118,10 +140,20 @@ class Reconstructor:
 
             cluster = clusters.get(chunk.cluster_id) if chunk.cluster_id is not None else None
             if cluster is not None and settings.cluster_markers:
-                marker = self._cluster_marker(cluster)
+                marker_id = f"c{cluster.id}"
+                marker = self._cluster_marker(cluster, marker_id)
                 pieces.append(marker)
                 kinds.append("marker")
                 markers.append(marker)
+                recoverable.append({
+                    "id": marker_id,
+                    "kind": "collapsed",
+                    "chunk_ids": list(cluster.member_ids[1:]),
+                    "sections": cluster.size - 1,
+                    "tokens": cluster.absorbed_tokens,
+                    "representative_id": cluster.representative_id,
+                    "method": cluster.method,
+                })
 
         flush_drops()
 
@@ -137,20 +169,26 @@ class Reconstructor:
             "marker_tokens": marker_tokens,
             "content_tokens": total_tokens - marker_tokens,
             "characters": len(text),
+            "recoverable_markers": len(recoverable),
         }
         return ReconstructionResult(
             text=text,
             metrics=metrics,
             marker_count=len(markers),
             marker_tokens=marker_tokens,
+            recoverable=recoverable,
         )
 
     # -- markers -----------------------------------------------------------
     @staticmethod
-    def _drop_marker(dropped: list[Chunk]) -> str:
+    def _drop_marker(dropped: list[Chunk], marker_id: str = "") -> str:
         tokens = sum(c.token_count for c in dropped)
         lines = f"{dropped[0].start_line}-{dropped[-1].end_line}"
-        head = f"[... omitted {len(dropped)} section(s), {tokens} tokens, lines {lines}"
+        tag = f" #{marker_id}" if marker_id else ""
+        head = (
+            f"[... omitted{tag} {len(dropped)} section(s), {tokens} tokens, "
+            f"lines {lines}"
+        )
 
         # Naming what went is worth real budget for code (a dropped function
         # name is a searchable fact) but not for logs, whose "symbol" is a
@@ -169,9 +207,10 @@ class Reconstructor:
         return f"{head} ...]"
 
     @staticmethod
-    def _cluster_marker(cluster: Cluster) -> str:
+    def _cluster_marker(cluster: Cluster, marker_id: str = "") -> str:
+        tag = f" #{marker_id}" if marker_id else ""
         return (
-            f"[x{cluster.size} near-identical occurrences collapsed "
+            f"[x{cluster.size}{tag} near-identical occurrences collapsed "
             f"({cluster.absorbed_tokens} tokens saved, {cluster.method} match)]"
         )
 

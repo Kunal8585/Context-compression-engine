@@ -21,15 +21,56 @@ should refuse to look ready until `warm` is true.
   "version": "0.1.0",
   "warm": true,
   "tokenizer": { "backend": "tiktoken:cl100k_base", "exact": true },
-  "embeddings": { "model": "all-MiniLM-L6-v2", "device": "mps", "available": true },
+  "embeddings": {
+    "model": "text-embedding-3-small", "device": "api", "available": true,
+    "provider": "openai", "chain": ["openai", "gemini", "cohere", "local"]
+  },
   "entities":   { "backend": "spacy:en_core_web_sm", "available": true },
-  "ollama":     { "available": false, "model": "llama3.2:3b", "error": "no model pulled" },
-  "capabilities": { "abstractive": false, "evaluate": false }
+  "generation": {
+    "available": true, "model": "groq:llama-3.3-70b-versatile",
+    "chain": ["groq", "gemini", "openai", "local"], "error": null
+  },
+  "providers": {
+    "offline_mode": false,
+    "keys_configured": {
+      "OPENAI_API_KEY": true,  "GROQ_API_KEY": true,   "GOOGLE_API_KEY": false,
+      "COHERE_API_KEY": false, "OPENROUTER_API_KEY": false
+    },
+    "keys_missing": ["COHERE_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"],
+    "embedding": {
+      "role": "embedding",
+      "chain": ["openai", "gemini", "cohere", "local"],
+      "active": "openai",
+      "last_used": "openai",
+      "providers": [
+        { "provider": "openai", "model": "text-embedding-3-small",
+          "configured": true, "requires_key": "OPENAI_API_KEY", "reason": null },
+        { "provider": "gemini", "model": "text-embedding-004",
+          "configured": false, "requires_key": "GOOGLE_API_KEY",
+          "reason": "GOOGLE_API_KEY is not configured" }
+      ]
+    },
+    "generation": { "role": "generation", "chain": ["groq", "gemini", "openai", "local"],
+                    "active": "groq", "last_used": "groq", "providers": [] },
+    "any_embedding_available": true,
+    "any_generation_available": true
+  },
+  "capabilities": { "abstractive": true, "evaluate_cached": true, "evaluate_live": true }
 }
 ```
 
 `capabilities` tells the UI which features to disable rather than letting a
 judge click a button that will fail.
+
+**`providers` never contains a key.** `keys_configured` is a presence map of
+booleans and is the only thing this endpoint will say about a credential; no
+value or fragment of one appears anywhere in the response. A backend test
+asserts this directly against every configured key.
+
+`active` is the first provider that *would* be tried — a configured key, not a
+proven-working one, since verifying that would cost real quota on every poll.
+`last_used` is the one that actually served the most recent call. They differ
+exactly when the chain has fallen back, which is the interesting case.
 
 ---
 
@@ -60,6 +101,143 @@ judge click a button that will fail.
 | `instruction` | no | protected chunk - never dropped |
 | `fast_mode` | no | skips stage 6 (abstractive); guaranteed-fast demo path |
 | `include_text` | no | see payload-size note below |
+| `mode` | no | `local` \| `cloud` \| `auto` (default) — see below |
+
+### `mode`: which providers may serve this request
+
+| Mode | Behaviour |
+|---|---|
+| `local` | Local providers only. **No outbound API call is made**, even with every key configured. Asserted by a test that severs the network transport and confirms a full compression still succeeds. |
+| `cloud` | Configured cloud providers only, in configured order. **Local is deliberately not a fallback.** An exhausted cloud chain returns `503 no_provider_available`. |
+| `auto` | The full configured chain — cloud first, local last. Default, and the pre-existing behaviour. |
+
+Why `cloud` refuses to degrade: a user who asked for cloud and silently received
+a 3B local model would read its latency and accuracy as cloud's, and draw
+exactly the wrong conclusion. A loud 503 is the honest answer.
+
+Both model-calling stages (stage 3 embeddings, stage 6 generation) resolve
+under the **same** mode within one request. Embedding in the cloud while
+generating locally would produce a run whose reported numbers describe a
+configuration nobody chose.
+
+`summary` gains `mode` (the mode that actually executed) and `providers_used`
+(stage name → the provider that served it):
+
+```json
+"summary": {
+  "mode": "cloud",
+  "providers_used": { "redundancy": "gemini", "abstractive": "groq" }
+}
+```
+
+Every entry in `stages[]` carries `provider_used` — the chain entry that
+actually **answered**, not the one tried first, so a fallback is visible rather
+than implied. It is `null` for the stages that call no model.
+
+```json
+{ "name": "redundancy", "provider_used": "gemini", "...": "..." }
+{ "name": "chunking",   "provider_used": null,     "...": "..." }
+```
+
+`/evaluate` accepts the same `mode` field, applied to its answering step.
+
+### Multi-file upload (`multipart/form-data`)
+
+The same endpoint also accepts a file upload, additively — the JSON contract
+above is unchanged. Send `multipart/form-data` with repeated `files` parts:
+
+| Part | Notes |
+|---|---|
+| `files` | repeated; `.txt` `.md` `.log` `.pdf` and common code extensions |
+| `text` | optional; pasted text, appended after the files |
+| `budget_ratio` | optional, as above |
+| `fast_mode` | optional, as above |
+
+Limits: **10 files**, **5 MB per file**, **10 MB total**. Exceeding any of them
+returns `413` before a single file is parsed.
+
+Files are concatenated in **upload order**, separated by a blank line. That is
+deterministic: the same files in the same order always produce the same context
+and therefore the same compression ratio.
+
+The response gains a `files[]` array, and every entry in `spans[]` gains a
+`source_file` naming which upload that range came from:
+
+```json
+"files": [
+  { "name": "postmortem.pdf", "status": "done",    "reason": null, "characters": 4192, "pages": 3 },
+  { "name": "auth_service.py","status": "done",    "reason": null, "characters": 8515 },
+  { "name": "scan.pdf",       "status": "skipped",
+    "reason": "no extractable text (a scanned or image-only PDF has no text layer)",
+    "characters": 0 }
+]
+```
+
+**A file that cannot be read is `skipped`, never fatal.** A batch of ten where
+one is a scan returns nine results and one explanation with HTTP 200. Only when
+*every* file yields no text does the endpoint return an error
+(`no_readable_input`, 422) — and that error carries the same per-file reasons,
+because the reasons are the useful part of it.
+
+**`source_file` attributes a chunk by where it starts.** Files are separated by
+a blank line, which the text chunker treats as a paragraph boundary, so chunks
+normally sit wholly inside one file. The exception is the small-chunk merge
+pass: two short fragments either side of a boundary can merge into one chunk,
+and that chunk is attributed to the file its first character came from. This is
+deliberate — the alternative is special-casing the chunker for uploads, and
+chunk boundaries are load-bearing for dedup and density scoring everywhere
+else. The badge marks where a file *begins*, which is what it is read as.
+
+### Response: `confidence`
+
+Every `/compress` response carries a `confidence` block — how much to trust
+*this* compression, computed from counts measured during the run. **No model is
+called.** It predicts fact survival; it does not guarantee it.
+
+```json
+"confidence": {
+  "score": 0.392,
+  "band": "low",
+  "components": {
+    "number_retention": 0.473,
+    "identifier_retention": 0.667,
+    "density_retention": 0.279,
+    "lossless_share": 0.0,
+    "dependency_integrity": 1.0
+  },
+  "reasons": [
+    "58 of 110 distinct numbers that survived deduplication were dropped by the budget (e.g. 240, 8.4)",
+    "only 28% of the document's density mass survived selection; the budget is forcing out scoring content",
+    "100% of the 1,004 removed tokens were unique content evicted by the budget, not duplicates collapsed - this input has little redundancy to exploit"
+  ],
+  "evidence": { "numbers_original": 110, "numbers_kept": 52, "...": "..." },
+  "method": "Deterministic. Weighted ratios over counts measured during this run; no model involved. Predicts fact survival, does not guarantee it."
+}
+```
+
+Bands: `high` ≥ 0.75, `moderate` ≥ 0.50, else `low`. `unknown` for empty input.
+
+**Retention is measured against the stage-3 survivors, not the raw input.**
+Deduplication is near-lossless — a collapsed cluster keeps its representative
+*and* a count marker — so the volatile timestamps and request ids it removes are
+not losses. Scored against the raw input instead, a 2,400-record log retains
+7.7% of its distinct numbers and the context with *perfect* measured fact
+survival scores lowest of four. Measured against survivors it scores 1.000.
+
+Validated by ranking, not asserted:
+
+```
+python -m engine.confidence --calibrate
+
+context          measured   predicted       band
+  log_incident    100.0%       1.000       high
+  auth_code        85.7%       0.541   moderate
+  tickets          66.7%       0.438        low
+  postmortem       62.5%       0.392        low
+  6/6 concordant pairs
+```
+
+n=4, so this establishes *ordering* only and is not a calibration claim.
 
 ### Response
 
@@ -170,7 +348,14 @@ demo itself.
   "generated_at": "2026-08-01T12:04:11Z",
   "cached": true,
   "config": {
-    "downstream_model": "llama3.2:3b",
+    "downstream_model": "groq:llama-3.3-70b-versatile",
+    "generation_chain": ["groq", "gemini", "openai", "local"],
+    "generation_provider": "groq",
+    "generation_attempts": [
+      { "provider": "groq", "ok": true, "skipped": false, "reason": "", "duration_ms": 812.4 }
+    ],
+    "embedding_chain": ["openai", "gemini", "cohere", "local"],
+    "embedding_provider": "openai",
     "judge": "gpt-4o-mini | qwen2.5:7b-instruct | exact-match",
     "budget_ratio": 0.30,
     "items": 15

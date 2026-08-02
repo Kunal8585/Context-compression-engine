@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# One-command local run.
+# One-command run.
 #
 #   ./run.sh              backend + frontend (if built)
 #   ./run.sh --backend    API only
 #   ./run.sh --check      verify the environment and exit
 #
-# Everything runs locally. No API key is required: the OpenAI judge is optional
-# and the harness falls back to deterministic key-fact recall without it.
+# API keys are optional. Model calls go through ordered fallback chains that
+# skip any provider without a key and end at local MiniLM + Ollama, so this
+# runs with five keys, one key, or none. `--check` prints which providers are
+# live right now; CCE_OFFLINE=1 forces local-only.
 
 set -euo pipefail
 
@@ -39,20 +41,26 @@ cfg = get_config()
 tk = get_tokenizer(cfg.tokenizer)
 print(f"  tokenizer   : {tk.backend}" + ("" if tk.is_exact else "  [ESTIMATE]"))
 
-emb = EmbeddingModel(cfg.redundancy)
-print(f"  embeddings  : {'ok' if emb.available else 'MISSING'} "
-      f"({cfg.redundancy.model} on {emb.device})")
+emb = EmbeddingModel(cfg)
+described = emb.describe()
+print(f"  embeddings  : {'ok' if described['available'] else 'MISSING'} "
+      f"({described['provider'] or 'none'}: {described['model']} on {described['device']})")
 
 ent = EntityScorer(cfg.density.spacy_model)
 print(f"  entities    : {'spacy' if ent.available else 'regex fallback'}")
 
-try:
-    import requests
-    models = [m.get("name","") for m in
-              requests.get(f"{cfg.abstractive.host}/api/tags", timeout=3).json().get("models", [])]
-    print(f"  ollama      : {models or 'running, no models pulled'}")
-except Exception as exc:
-    print(f"  ollama      : unavailable ({exc}) - stages 6 and 8 will degrade")
+from engine.providers import provider_status
+status = provider_status(cfg)
+present = [k for k, ok in status["keys_configured"].items() if ok]
+print(f"  keys set    : {', '.join(present) or 'none (local providers only)'}")
+# "next" is the first provider that WOULD be tried - a configured key, not a
+# proven-working one. Verifying that costs real quota, so it is a separate
+# opt-in command rather than something every --check pays for.
+for role in ("embedding", "generation"):
+    chain = status[role]
+    print(f"  {role:<12}: next={chain['active'] or 'NONE AVAILABLE'}"
+          f"  (chain: {' -> '.join(chain['chain'])})")
+print("  (verify for real: python -m engine.providers.check --chains)")
 
 from pathlib import Path
 report = Path("reports/latest.json")
@@ -78,7 +86,18 @@ trap cleanup INT TERM EXIT
 
 # --- backend -----------------------------------------------------------------
 info "Starting API on http://localhost:$API_PORT  (docs at /docs)"
-"$VENV/bin/uvicorn" backend.main:app --host 0.0.0.0 --port "$API_PORT" &
+# `$PY -m uvicorn`, never `$VENV/bin/uvicorn`.
+#
+# Console scripts in .venv/bin hard-code the absolute path of the interpreter
+# that created them. Copy or rename the project directory and every one of them
+# silently re-execs the OLD venv - same command, same apparent success, but a
+# different site-packages. That is exactly how this repo ended up serving
+# requests from a sibling checkout's dependencies, where pdfplumber was absent
+# and every PDF upload reported "not installed".
+#
+# `python -m` resolves the module against the interpreter actually being run,
+# so it cannot drift. Use it for every venv entry point.
+"$PY" -m uvicorn backend.main:app --host 0.0.0.0 --port "$API_PORT" &
 PIDS+=($!)
 
 # Wait for the port, then for the models to finish warming. A judge's first

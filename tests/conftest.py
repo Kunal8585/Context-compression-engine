@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -9,12 +10,30 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Collapse both provider chains to their local entries for the whole suite.
+#
+# Set before any engine import so no module-level chain is built against a
+# hosted provider. A unit test must never depend on a network, someone's API
+# key, or a free tier's remaining quota - a suite that turns red because Groq
+# is rate-limited is worse than no suite. Tests that exercise the cloud
+# providers do so against scripted transports (tests/test_providers.py); tests
+# that hit real APIs are opt-in and marked `integration`.
+os.environ.setdefault("CCE_OFFLINE", "1")
+
 CORPUS = PROJECT_ROOT / "data" / "sample_corpus"
 
 
 @pytest.fixture(scope="session")
 def corpus() -> Path:
     return CORPUS
+
+
+@pytest.fixture()
+def config():
+    """The project's real config.yaml, for tests that exercise provider wiring."""
+    from engine.config import get_config
+
+    return get_config()
 
 
 @pytest.fixture(scope="session")

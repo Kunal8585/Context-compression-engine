@@ -3,7 +3,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .DS_Store
-.env
+
+# Every .env variant is a secret except the committed template. Bare `.env`
+# alone left .env.local, .env.production and .env.bak committable, which is
+# exactly the shape of an accidental key leak.
+.env*
+!.env.example
 
 # Model + tokenizer caches
 .cache/

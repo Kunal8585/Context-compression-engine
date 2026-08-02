@@ -2,8 +2,15 @@
 
 Stage 6 is the only stage that rewrites text, so it is the only one that can
 invent a fact. These tests are mostly about what it *refuses* to do. They use a
-scripted client rather than a live model so they are fast and deterministic;
+scripted provider rather than a live model so they are fast and deterministic;
 the real-model behaviour is measured separately and recorded in the README.
+
+Since the provider migration the scripted client is a real
+:class:`~engine.abstractive.GenerationClient` over a real ``GenerationChain``,
+with only the HTTP call replaced - so these still exercise the shipped path.
+The safety checks below are deliberately unchanged by that migration: a cloud
+model can drop a fact in a paraphrase exactly like a local one can, and the net
+that catches it is provider-agnostic.
 """
 
 from __future__ import annotations
@@ -14,39 +21,16 @@ import pytest
 
 from engine.abstractive import (
     AbstractiveCompressor,
-    OllamaClient,
+    GenerationClient,
     _strip_fences,
     critical_tokens,
     numbers_in,
 )
 from engine.config import get_config
 from engine.types import Chunk, ChunkKind, StageStatus
+from provider_doubles import ScriptedClient
 
 LONG = 200  # comfortably above min_tokens_to_compress
-
-
-class ScriptedClient(OllamaClient):
-    """Returns canned completions; records what it was asked."""
-
-    def __init__(self, responses=None, available=True, delay=0.0):
-        super().__init__(get_config().abstractive)
-        self._responses = responses or {}
-        self._available_flag = available
-        self._delay = delay
-        self.calls: list[str] = []
-        self._error = None if available else "scripted: unavailable"
-
-    def available(self, refresh: bool = False) -> bool:
-        return self._available_flag
-
-    def generate(self, prompt: str, timeout: float):
-        self.calls.append(prompt)
-        if self._delay:
-            time.sleep(self._delay)
-        for needle, response in self._responses.items():
-            if needle in prompt:
-                return response
-        return None
 
 
 def _chunk(text: str, order: int = 0, tokens: int = LONG, kind=ChunkKind.PARAGRAPH) -> Chunk:

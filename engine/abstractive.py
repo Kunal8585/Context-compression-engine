@@ -1,15 +1,16 @@
-"""Stage 6 - optional abstractive compression via a local model.
+"""Stage 6 - optional abstractive compression via the generation provider chain.
 
 Every other stage in this pipeline is *extractive*: it decides what to keep, and
 what it keeps is byte-identical to the input. This stage is the only one that
 rewrites text, which makes it the only one that can invent something that was
 never there. It is therefore built defensively, and it is optional.
 
-Three guarantees:
+Three guarantees, none of which changed when the model moved to the cloud:
 
 **It cannot hang the demo.** Every call has a per-request timeout, the stage has
 an overall wall-clock ceiling, and a chunk that times out keeps its original
-text. If Ollama is not running, the stage reports ``skipped`` and the pipeline
+text. If no provider in the chain can run - no keys, no network, no local
+Ollama - the stage reports ``skipped`` with the reason and the pipeline
 continues unchanged.
 
 **It cannot silently lose a fact.** Every paraphrase is checked against the
@@ -17,6 +18,13 @@ original for critical-token retention - numbers, identifiers, error codes,
 named entities. Numbers are non-negotiable: a paraphrase that turns a 64
 character limit into 128, or drops ``8000ms``, is discarded and the original
 kept. This is the check that makes rewriting safe enough to ship.
+
+*This check is unchanged by the provider migration, deliberately.* A frontier
+model is not a trustworthy paraphraser of a fact-dense log line just because it
+is large - it is a better one, which shifts the rejection rate, not the need
+for the net. The safety property must hold for whichever provider the chain
+happens to resolve to, so it is enforced here, provider-agnostically, on the
+text that comes back.
 
 **It cannot make things worse.** A paraphrase that is not actually shorter is
 rejected, so the stage is monotonic: output tokens never exceed input tokens.
@@ -33,6 +41,7 @@ from dataclasses import dataclass, field
 
 from .config import AbstractiveConfig, Config, get_config
 from .entities import EntityScorer
+from .providers import GenerationChain, build_generation_chain
 from .tokenizer import Tokenizer, get_tokenizer
 from .types import Chunk, StageMetrics, StageStatus
 
@@ -64,6 +73,13 @@ _IDENTIFIER = re.compile(
     r"|[a-z]+[A-Z]\w*"                                  # camelCase
     r"|[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)*)\b"             # CONSTANT_CASE
 )
+
+
+#: Below this much remaining stage budget, a paraphrase call is not attempted.
+#: Measured: llama3.2:3b needs 3-6 s for a 150-250 token chunk, and even the
+#: fastest hosted provider needs ~1 s of round trip. Anything under this is a
+#: request issued only to time out.
+MIN_CALL_SECONDS = 2.5
 
 
 def critical_tokens(text: str) -> set[str]:
@@ -101,68 +117,77 @@ class AbstractiveResult:
         return len(self.rejected) / attempted if attempted else 0.0
 
 
-class OllamaClient:
-    """Minimal Ollama HTTP client that never raises into the pipeline."""
+class GenerationClient:
+    """Stage 6's view of the generation chain: never raises, never blocks.
 
-    def __init__(self, cfg: AbstractiveConfig) -> None:
+    A deliberately narrow adapter rather than a second provider stack. The
+    chain in :mod:`engine.providers.chain` does the ordering, key checks,
+    fallback and redaction; this class does the two things stage 6 specifically
+    needs, which the harness explicitly does *not* want:
+
+    * ``generate`` returns ``None`` instead of raising. A chunk that cannot be
+      paraphrased keeps its original text - that is the stage's contract, and
+      an exhausted chain is just another way for one chunk to be left alone.
+    * ``available`` is a bool with a readable ``error``, because that is what
+      the pipeline's skip path and ``/health`` already consume.
+    """
+
+    def __init__(self, chain: GenerationChain, cfg: AbstractiveConfig) -> None:
+        self.chain = chain
         self.cfg = cfg
-        self._available: bool | None = None
         self._error: str | None = None
 
     def available(self, refresh: bool = False) -> bool:
-        if self._available is not None and not refresh:
-            return self._available
-        try:
-            import requests
-
-            response = requests.get(f"{self.cfg.host}/api/tags", timeout=2.0)
-            response.raise_for_status()
-            models = [m.get("name", "") for m in response.json().get("models", [])]
-            wanted = self.cfg.model
-            self._available = any(
-                name == wanted or name.split(":")[0] == wanted.split(":")[0]
-                for name in models
-            )
-            if not self._available:
-                self._error = (
-                    f"model {wanted!r} not pulled (available: {models or 'none'})"
-                )
-        except Exception as exc:
-            self._available = False
-            self._error = f"ollama unreachable at {self.cfg.host}: {exc}"
-        return self._available
+        ok, reason = self.chain.available()
+        self._error = None if ok else reason
+        return ok
 
     @property
     def error(self) -> str | None:
         return self._error
 
-    def generate(self, prompt: str, timeout: float) -> str | None:
-        """Return the model's completion, or None on any failure."""
-        try:
-            import requests
+    @property
+    def provider(self) -> str | None:
+        """Whichever provider last answered - what the metrics should report."""
+        return self.chain.last_provider
 
-            response = requests.post(
-                f"{self.cfg.host}/api/generate",
-                json={
-                    "model": self.cfg.model,
-                    "prompt": prompt,
-                    "system": SYSTEM_PROMPT,
-                    "stream": False,
-                    "options": {"temperature": self.cfg.temperature},
-                },
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return (response.json().get("response") or "").strip()
-        except Exception as exc:
-            log.debug("ollama generate failed: %s", exc)
-            return None
+    @property
+    def model(self) -> str:
+        name = self.chain.last_provider or self.chain.active_provider_name()
+        provider = next((p for p in self.chain.providers if p.name == name), None)
+        return f"{name}:{provider.model}" if provider else "none"
+
+    def generate(
+        self, prompt: str, timeout: float, max_tokens: int = 512
+    ) -> str | None:
+        """Return a paraphrase, or None if every provider was skipped or failed.
+
+        ``max_tokens`` is the *original* chunk's size. A paraphrase longer than
+        its input is rejected by the caller anyway, so capping the completion
+        there costs nothing and stops a runaway generation from eating the
+        stage's whole wall-clock budget - which matters far more now that a
+        token is billed rather than merely slow.
+        """
+        return self.chain.try_generate(
+            prompt,
+            max_tokens=max(64, max_tokens),
+            timeout_s=timeout,
+            system=SYSTEM_PROMPT,
+        )
 
     def warmup(self) -> float:
-        """Load the model into memory (~15 s cold) so the first real call is fast."""
+        """Resolve the chain and pay any cold-start cost up front.
+
+        On the local provider this is Ollama loading the model (~15 s cold). On
+        a hosted one it is DNS, TLS and the chain walk - much cheaper, but still
+        better paid before a judge's first request than during it.
+        """
         started = time.perf_counter()
-        self.generate("ok", timeout=60.0)
+        self.chain.try_generate("ok", max_tokens=8, timeout_s=60.0)
         return (time.perf_counter() - started) * 1000
+
+    def describe(self) -> dict:
+        return self.chain.describe()
 
 
 class AbstractiveCompressor:
@@ -170,13 +195,16 @@ class AbstractiveCompressor:
         self,
         cfg: Config | None = None,
         tokenizer: Tokenizer | None = None,
-        client: OllamaClient | None = None,
+        client: GenerationClient | None = None,
         entity_scorer: EntityScorer | None = None,
     ) -> None:
         self.cfg = cfg or get_config()
         self.settings = self.cfg.abstractive
         self.tokenizer = tokenizer or get_tokenizer(self.cfg.tokenizer)
-        self.client = client or OllamaClient(self.settings)
+        self.client = client or GenerationClient(
+            build_generation_chain(self.cfg, timeout_s=self.settings.timeout_s),
+            self.settings,
+        )
         self.entity_scorer = entity_scorer or EntityScorer(self.cfg.density.spacy_model)
 
     def run(self, chunks: list[Chunk], fast_mode: bool = False) -> AbstractiveResult:
@@ -228,7 +256,11 @@ class AbstractiveCompressor:
                 timed_out += 1
                 continue
             remaining = min(self.settings.timeout_s, deadline - time.perf_counter())
-            if remaining <= 0.5:
+            # Don't start a call the budget cannot finish. A sub-MIN_CALL_SECONDS
+            # window is not enough for any provider - local or hosted - to return
+            # a paraphrase, so issuing the request only burns the remainder of
+            # the stage budget on a guaranteed timeout.
+            if remaining < MIN_CALL_SECONDS:
                 timed_out += 1
                 continue
 
@@ -253,8 +285,17 @@ class AbstractiveCompressor:
                 f"{timed_out} chunk(s) skipped: {self.settings.total_timeout_s}s "
                 f"stage budget exhausted"
             )
+        telemetry = self.client.chain.telemetry()
+        metrics.provider_used = telemetry["provider_used"]
         metrics.details = {
-            "model": self.settings.model,
+            # Which model actually rewrote the text, not which one was asked
+            # first - with a fallback chain those are routinely different, and
+            # the rejection rate below is only interpretable against the one
+            # that ran.
+            "model": self.client.model,
+            "provider": telemetry["provider_used"],
+            "provider_chain": telemetry["chain"],
+            "fell_back": telemetry["fell_back"],
             "attempted": len(candidates),
             "accepted": result.accepted,
             "rejected": len(result.rejected),
@@ -268,7 +309,7 @@ class AbstractiveCompressor:
 
     # -- one chunk ---------------------------------------------------------
     def _compress_one(self, chunk: Chunk, timeout: float) -> str | Rejection:
-        completion = self.client.generate(chunk.text, timeout)
+        completion = self.client.generate(chunk.text, timeout, chunk.token_count)
         if not completion:
             return Rejection(chunk.id, "no_response", "timeout or model error")
 

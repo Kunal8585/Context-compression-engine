@@ -17,14 +17,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .abstractive import AbstractiveCompressor
+from .abstractive import AbstractiveCompressor, GenerationClient
 from .chunker import chunk_document, detect_kind
 from .config import Config, get_config
+from .confidence import Confidence, score_compression
+from .providers import (
+    build_embedding_chain,
+    build_generation_chain,
+    normalise_mode,
+)
 from .density import DensityScorer
 from .embeddings import EmbeddingModel
 from .reconstruct import Reconstructor
 from .redundancy import RedundancyDetector
-from .selector import BudgetSelector
+from .selector import BudgetSelector, SelectionResult, KEPT_DENSITY, DROPPED_BUDGET
 from .tokenizer import Tokenizer, get_tokenizer
 from .types import Chunk, ChunkKind, StageMetrics, StageStatus
 
@@ -66,6 +72,13 @@ class CompressionResult:
     repaired_dependencies: list[dict] = field(default_factory=list)
     tokenizer_exact: bool = True
     total_ms: float = 0.0
+    #: Measured trustworthiness of this compression. See engine/confidence.py.
+    confidence: Confidence | None = None
+    #: Execution mode this run used: local | cloud | auto.
+    mode: str = "auto"
+    #: What each marker in the compressed text hides, addressable by the id
+    #: printed inside it. See `/expand` - compression with an escape hatch.
+    markers: list[dict] = field(default_factory=list)
 
     @property
     def compression_ratio(self) -> float:
@@ -77,10 +90,21 @@ class CompressionResult:
     def stage(self, name: str) -> StageMetrics | None:
         return next((s for s in self.stages if s.name == name), None)
 
+    @property
+    def providers_used(self) -> dict[str, str | None]:
+        """Which provider served each model-calling stage."""
+        return {
+            stage.name: stage.provider_used
+            for stage in self.stages
+            if stage.provider_used
+        }
+
     def summary(self) -> dict[str, Any]:
         return {
             "source_name": self.source_name,
             "detected_kind": self.detected_kind,
+            "mode": self.mode,
+            "providers_used": self.providers_used,
             "original_tokens": self.original_tokens,
             "compressed_tokens": self.compressed_tokens,
             "tokens_saved": self.original_tokens - self.compressed_tokens,
@@ -118,7 +142,8 @@ class CompressionResult:
             if chunk.start_char < 0:
                 continue
             kept = bool(chunk.selected)
-            if spans and spans[-1]["kept"] == kept:
+            source_file = chunk.metadata.get("source_file", self.source_name)
+            if spans and spans[-1]["kept"] == kept and spans[-1].get("source_file") == source_file:
                 previous = spans[-1]
                 previous["end"] = chunk.end_char
                 previous["count"] += 1
@@ -140,6 +165,7 @@ class CompressionResult:
                     "density": chunk.density,
                     "reason": chunk.drop_reason,
                     "duplicate_count": chunk.duplicate_count,
+                    "source_file": source_file,
                 }
             )
         return spans
@@ -149,12 +175,22 @@ class CompressionResult:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "summary": self.summary(),
+            "confidence": self.confidence.to_dict() if self.confidence else None,
             "stages": [s.to_dict() for s in self.stages],
             "audit_trail": self.audit_trail,
             "broken_dependencies": self.broken_dependencies,
             "repaired_dependencies": self.repaired_dependencies,
             "compressed_text": self.compressed_text,
             "spans": self.spans(),
+            # Marker *addresses*, not their contents - and deliberately without
+            # `chunk_ids`. A 2,400-record log collapses into 146 clusters whose
+            # member id lists run to thousands of strings, which would put back
+            # exactly the payload weight the spans design exists to remove. The
+            # ids stay in-process for `/expand` to resolve.
+            "markers": [
+                {k: v for k, v in marker.items() if k != "chunk_ids"}
+                for marker in self.markers
+            ],
         }
         if include_original:
             payload["original_text"] = self.original_text
@@ -171,14 +207,44 @@ class CompressionPipeline:
         cfg: Config | None = None,
         tokenizer: Tokenizer | None = None,
         embedder: EmbeddingModel | None = None,
+        mode: str | None = None,
+        embedding_provider: str | None = None,
+        generation_provider: str | None = None,
     ) -> None:
         self.cfg = cfg or get_config()
+        # One mode per pipeline instance, fixed at construction. Deliberately
+        # not a per-call argument that mutates shared chains: FastAPI runs sync
+        # endpoints on a threadpool, so two concurrent requests swapping the
+        # embedder on one shared object would interleave and each would report
+        # the other's provider. The API keeps one pipeline per mode instead.
+        self.mode = normalise_mode(mode)
+        # An explicitly chosen provider overrides the mode for that role, and
+        # gets no fallback - see _pinned() for why.
+        self.embedding_provider = embedding_provider
+        self.generation_provider = generation_provider
         self.tokenizer = tokenizer or get_tokenizer(self.cfg.tokenizer)
-        self.embedder = embedder or EmbeddingModel(self.cfg.redundancy)
+        self.embedder = embedder or EmbeddingModel(
+            self.cfg,
+            chain=build_embedding_chain(
+                self.cfg, mode=self.mode, pin=embedding_provider
+            ),
+        )
         self.redundancy = RedundancyDetector(self.cfg, self.tokenizer, self.embedder)
         self.density = DensityScorer(self.cfg, self.tokenizer)
         self.selector = BudgetSelector(self.cfg)
-        self.abstractive = AbstractiveCompressor(self.cfg, self.tokenizer)
+        self.abstractive = AbstractiveCompressor(
+            self.cfg,
+            self.tokenizer,
+            client=GenerationClient(
+                build_generation_chain(
+                    self.cfg,
+                    timeout_s=self.cfg.abstractive.timeout_s,
+                    mode=self.mode,
+                    pin=generation_provider,
+                ),
+                self.cfg.abstractive,
+            ),
+        )
         self.reconstructor = Reconstructor(self.cfg, self.tokenizer)
 
     def warmup(self) -> dict[str, float]:
@@ -188,7 +254,7 @@ class CompressionPipeline:
         self.density.entity_scorer.count_all(["warmup text with 3 numbers"])
         timings["entities_ms"] = (time.perf_counter() - started) * 1000
         if self.cfg.abstractive.enabled and self.abstractive.client.available():
-            timings["ollama_ms"] = self.abstractive.client.warmup()
+            timings["generation_ms"] = self.abstractive.client.warmup()
         return timings
 
     def compress(
@@ -200,6 +266,8 @@ class CompressionPipeline:
         query: str | None = None,
         instruction: str | None = None,
         fast_mode: bool = False,
+        selection_strategy: str = "density",
+        source_files: list[dict[str, Any]] | None = None,
     ) -> CompressionResult:
         started = time.perf_counter()
         ratio = (
@@ -210,6 +278,7 @@ class CompressionPipeline:
             source_name=name,
             budget_ratio=ratio,
             tokenizer_exact=self.tokenizer.is_exact,
+            mode=self.mode,
         )
         if not source or not source.strip():
             # Still emit the full six-stage shape: the dashboard accordion is
@@ -224,6 +293,13 @@ class CompressionPipeline:
         # --- stage 2: chunking ---
         chunk_started = time.perf_counter()
         chunks = chunk_document(source, name, kind, self.cfg.chunking, self.tokenizer)
+        if source_files:
+            for chunk in chunks:
+                chunk.metadata["source_file"] = next(
+                    (entry["name"] for entry in source_files
+                     if entry["start"] <= chunk.start_char < entry["end"]),
+                    name,
+                )
         result.detected_kind = detect_kind(name, source) if kind == "auto" else kind
 
         # Protected chunks are prepended so they can never be dropped, and are
@@ -262,7 +338,33 @@ class CompressionPipeline:
         result.stages.append(redundancy.metrics)
 
         # --- stage 4: density ---
-        density = self.density.run(redundancy.chunks, redundancy.embeddings)
+        #
+        # The query is already a protected chunk, so stage 3 embedded it in the
+        # SAME batch as everything else. Reuse that row rather than issuing a
+        # second chain call.
+        #
+        # Two wins, and the second is the important one. It removes a network
+        # round trip from every query-aware compression - on a cold chain with
+        # exhausted providers ahead of a working one, that was ~1.5 s. And it
+        # makes "query and chunks share a vector space" true by construction
+        # instead of by check: a separate call can land on a different provider
+        # if the first entered cooldown in between, and a 3072-d Gemini query
+        # dotted against 1024-d Cohere chunks is a crash, not a weak signal.
+        # Same call, same provider, same space - nothing left to verify.
+        query_embedding = None
+        if query and query.strip() and redundancy.embeddings is not None:
+            query_id = f"{name}#protected:{ChunkKind.QUERY}"
+            row = next(
+                (i for i, c in enumerate(redundancy.chunks) if c.id == query_id),
+                None,
+            )
+            if row is not None and row < len(redundancy.embeddings):
+                query_embedding = redundancy.embeddings[row]
+            else:
+                log.debug("query chunk not among stage 3 survivors; relevance skipped")
+        density = self.density.run(
+            redundancy.chunks, redundancy.embeddings, query_embedding
+        )
         result.stages.append(density.metrics)
 
         # --- stages 5 + 7: select, reconstruct, and hold the budget ---
@@ -291,10 +393,8 @@ class CompressionPipeline:
         previous_used: int | None = None
 
         for attempts in range(1, 7):
-            candidate = self.selector.run(
-                redundancy.chunks,
-                original_tokens=original_tokens,
-                budget_tokens=allowance,
+            candidate = self._select(
+                redundancy.chunks, original_tokens, allowance, selection_strategy
             )
             rebuilt = self.reconstructor.run(
                 chunks, candidate.kept, redundancy.clusters, absorbed_ids
@@ -370,9 +470,65 @@ class CompressionPipeline:
         result.stages.append(reconstruction.metrics)
         result.compressed_text = reconstruction.text
         result.compressed_tokens = reconstruction.metrics.tokens_out
+        result.markers = reconstruction.recoverable
+
+        # --- confidence: how much to trust what just came out ---
+        #
+        # Scored against the *reconstructed* text, not the kept chunk list, so
+        # it reflects the artifact that actually ships - drop markers, cluster
+        # annotations and any stage 6 paraphrase included. Costs no model call
+        # and no measurable time; it is a handful of set operations over text
+        # the pipeline is already holding.
+        redundancy_metrics = redundancy.metrics
+        result.confidence = score_compression(
+            source,
+            result.compressed_text,
+            chunks,
+            selection.kept,
+            # Stage 3's output is the baseline for lexical retention: what it
+            # collapsed was redundant by construction, not lost.
+            survivors=redundancy.chunks,
+            tokens_removed_by_redundancy=max(
+                0, redundancy_metrics.tokens_in - redundancy_metrics.tokens_out
+            ),
+            tokens_removed_total=max(0, original_tokens - result.compressed_tokens),
+            broken_dependencies=len(result.broken_dependencies),
+            repaired_dependencies=len(result.repaired_dependencies),
+        )
 
         result.total_ms = (time.perf_counter() - started) * 1000
         return result
+
+    def _select(self, chunks: list[Chunk], original_tokens: int, budget_tokens: int,
+                strategy: str) -> SelectionResult:
+        """Offline evaluation alternatives; the API keeps the density default."""
+        if strategy == "density":
+            return self.selector.run(chunks, original_tokens=original_tokens,
+                                     budget_tokens=budget_tokens)
+        if strategy not in {"truncate", "random"}:
+            raise ValueError(f"unknown selection strategy: {strategy}")
+        import random
+        candidates = list(chunks)
+        if strategy == "random":
+            random.Random(1337).shuffle(candidates)
+        else:
+            candidates.sort(key=lambda c: c.order)
+        kept: list[Chunk] = []
+        used = 0
+        for chunk in candidates:
+            if used + chunk.token_count <= budget_tokens:
+                chunk.selected, chunk.drop_reason = True, KEPT_DENSITY
+                kept.append(chunk)
+                used += chunk.token_count
+            else:
+                chunk.selected, chunk.drop_reason = False, DROPPED_BUDGET
+        kept.sort(key=lambda c: c.order)
+        metrics = StageMetrics(name="selection", chunks_in=len(chunks), chunks_out=len(kept),
+                               tokens_in=sum(c.token_count for c in chunks), tokens_out=used,
+                               details={"strategy": strategy, "budget_tokens": budget_tokens})
+        return SelectionResult(kept=kept, dropped=[c for c in chunks if not c.selected],
+                               metrics=metrics, budget_tokens=budget_tokens,
+                               used_tokens=used, original_tokens=original_tokens)
 
     # -- helpers -----------------------------------------------------------
     def _protected_chunks(

@@ -110,9 +110,11 @@ def test_drop_markers_report_what_was_removed():
     chunks = [_chunk(f"Paragraph number {i}.", i, 10) for i in range(6)]
     result = reconstruct(chunks, [chunks[0], chunks[5]])
 
-    assert "omitted 4 section(s)" in result.text
+    # The `#d0` tag is the marker's address for /expand - see reconstruct.py.
+    assert "omitted #d0 4 section(s)" in result.text
     assert "40 tokens" in result.text
     assert result.marker_count == 1
+    assert [m["id"] for m in result.recoverable] == ["d0"]
 
 
 def test_cluster_markers_report_collapsed_duplicates():
@@ -125,8 +127,9 @@ def test_cluster_markers_report_collapsed_duplicates():
     )
     result = reconstruct([representative], [representative], {0: cluster})
 
-    assert "x172 near-identical" in result.text
+    assert "x172 #c0 near-identical" in result.text
     assert "6752 tokens saved" in result.text
+    assert [m["id"] for m in result.recoverable] == ["c0"]
 
 
 def test_absorbed_chunks_do_not_get_their_own_drop_marker():

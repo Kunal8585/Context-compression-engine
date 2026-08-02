@@ -4,13 +4,14 @@
     python -m diagnostic.gpt4o_mini_check
 
 **This is diagnostic-only and is deliberately not wired into the pipeline.**
-Nothing here is imported by ``/compress`` or ``/evaluate``, and the shipped
-answering model stays local regardless of what this reports. Running entirely
-on-device with no API key is the project's differentiator; this script exists to
-answer one question and then get out of the way.
+Nothing here is imported by ``/compress`` or ``/evaluate``, and it is not part
+of the provider layer in :mod:`engine.providers` - it deliberately pins one
+specific model rather than walking a fallback chain, because the whole point is
+to attribute a retrieval difference to *that* model. A chain that silently
+substituted a different one would answer a question nobody asked.
 
 The question: stage 8 showed 80.8% of key facts survive compression but the
-local 3B model retrieves only ~57% of them, and on 4 items it answered
+3B model that served the run retrieves only ~57% of them, and on 4 items it answered
 "NOT FOUND" while the fact was verifiably present in the compressed text. Is
 that a model-capability limit, or is something about the compressed context's
 structure at fault?

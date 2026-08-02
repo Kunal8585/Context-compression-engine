@@ -177,6 +177,11 @@ class StageMetrics:
     tokens_in: int = 0
     tokens_out: int = 0
     note: str | None = None
+    #: Which provider actually served this stage, for the stages that call a
+    #: model (redundancy, abstractive). Names the chain entry that answered -
+    #: not the one that was tried first - so a fallback is visible rather than
+    #: implied. None for the stages that call no model at all.
+    provider_used: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -201,5 +206,6 @@ class StageMetrics:
             "tokens_removed": self.tokens_removed,
             "reduction_pct": round(self.reduction_pct, 2),
             "note": self.note,
+            "provider_used": self.provider_used,
             "details": self.details,
         }

@@ -65,6 +65,7 @@ export function StageAccordion({ stages }: { stages: Stage[] }) {
         Pipeline stages
         <span className="ml-2 text-xs font-normal text-neutral-600">
           every run reports all six
+          {/* The engine begins at stage 2; stage 1 is input ingestion. */}
         </span>
       </h2>
 
@@ -78,7 +79,7 @@ export function StageAccordion({ stages }: { stages: Stage[] }) {
                 className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-neutral-900"
               >
                 <span className="w-4 shrink-0 font-mono text-xs text-neutral-600">
-                  {index + 1}
+                  {index + 2}
                 </span>
                 <span className="w-32 shrink-0 text-sm text-neutral-200">
                   {stage.name}

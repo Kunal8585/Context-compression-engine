@@ -10,18 +10,25 @@ for accuracy, latency and cost originates here, measured.
 
 Method notes, because these are what a judge should be able to interrogate:
 
+* **The model that answers is the one the provider chain resolves to.** The
+  harness shares :class:`~engine.providers.chain.GenerationChain` with stage 6,
+  and every report records which entry actually served the run - not which one
+  config.yaml lists first. Both conditions go through the same object, so a
+  mid-run fallback applies equally to the compressed and uncompressed arms.
 * **The uncompressed context must fit the model.** Ollama silently truncates
   past ``num_ctx``; a truncated "original" would flatter the compressed run.
-  ``num_ctx`` is set explicitly and the harness refuses to run an item whose
-  original context exceeds it.
+  ``num_ctx`` is set explicitly and the harness refuses to run such an item.
+  The guard applies to the local provider only - hosted models have much larger
+  windows and reject an oversized prompt rather than quietly shortening it.
 * **Accuracy is deterministic key-fact recall**, not a model grading itself.
   See :mod:`eval.scoring`.
 * **Cost is computed, not asserted** - published per-1M-token prices from
-  ``config.yaml`` applied to measured token counts. Local inference is free, so
-  the dollar figure answers "what would this prompt cost against a hosted API",
-  which is the number that transfers off this laptop.
-* **Latency is wall-clock on this machine** (M2, llama3.2:3b) and is therefore
-  hardware-specific. Compression ratio and cost are not.
+  ``config.yaml`` applied to measured token counts.
+* **Latency is wall-clock, and now includes the network.** It is a property of
+  the provider that served the run and the connection it ran over, so it is the
+  least transferable number here. Compression ratio and token counts are not:
+  they are properties of the compressor alone and do not move when the provider
+  does.
 """
 
 from __future__ import annotations
@@ -39,9 +46,16 @@ from pathlib import Path
 
 from engine.config import PROJECT_ROOT, Config, get_config
 from engine.pipeline import CompressionPipeline
+from engine.providers import (
+    GenerationChain,
+    NoProviderAvailable,
+    build_generation_chain,
+    normalise_mode,
+)
 from engine.tokenizer import get_tokenizer
 
 from .scoring import Judge, key_fact_recall
+from .providers import available_providers
 from .testset import (
     EvalContext,
     TestItem,
@@ -55,12 +69,54 @@ log = logging.getLogger(__name__)
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
 DIAGNOSTIC_REPORT = PROJECT_ROOT / "eval" / "diagnostic_report.json"
+BASELINE_REPORT = REPORTS_DIR / "baseline_comparison.json"
 
 SYSTEM_PROMPT = (
     "Answer the question using ONLY the provided context. Be specific and "
     "concise: state the exact values, names and identifiers the context gives. "
     "If the context does not contain the answer, reply exactly: NOT FOUND."
 )
+
+#: LLMLingua-2's smallest published checkpoint. The paper's LLMLingua-1 default
+#: is llama-7b, which is not a fair ask of a laptop; -2 is also the newer and
+#: stronger method, so comparing against it is the harder test of the two.
+LLMLINGUA_MODEL = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
+_LLMLINGUA: object | None = None
+_LLMLINGUA_TRIED = False
+
+
+def _load_llmlingua():
+    """Load LLMLingua-2 once, or return None if it cannot be had.
+
+    Imported from a neutral working directory on purpose. nltk (an llmlingua
+    dependency) refuses to import any module that resolves inside the current
+    directory, and this project's virtualenv lives *inside* the project - so
+    every site-package looks like a CWD import to that check and the import
+    dies. Restoring the cwd afterwards keeps the rest of the harness, which
+    reads relative paths, unaffected.
+    """
+    global _LLMLINGUA, _LLMLINGUA_TRIED
+    if _LLMLINGUA_TRIED:
+        return _LLMLINGUA
+    _LLMLINGUA_TRIED = True
+
+    import os
+    import tempfile
+
+    previous = os.getcwd()
+    try:
+        os.chdir(tempfile.gettempdir())
+        from llmlingua import PromptCompressor
+
+        _LLMLINGUA = PromptCompressor(
+            model_name=LLMLINGUA_MODEL, use_llmlingua2=True, device_map="cpu"
+        )
+    except Exception as exc:  # noqa: BLE001 - an optional baseline, never fatal
+        log.warning("llmlingua unavailable (%s); its rows will be skipped", exc)
+        _LLMLINGUA = None
+    finally:
+        os.chdir(previous)
+    return _LLMLINGUA
 
 
 @dataclass
@@ -87,91 +143,151 @@ class ItemResult:
 
 
 class DownstreamModel:
-    """The model both conditions are measured against. Identical settings."""
+    """The model both conditions are measured against. Identical settings.
 
-    def __init__(self, cfg: Config) -> None:
+    Since the provider migration this is the *same* ``GenerationChain`` stage 6
+    uses - same ordering, same fallback, same timeouts - asked a different
+    question with a different system prompt. Sharing it is the point: there is
+    now one answer to "which model produced these numbers", and the report
+    records whichever chain entry actually served the run rather than whichever
+    one was configured first.
+
+    The comparison stays fair because both conditions go through this one
+    object: if the chain falls back mid-run, it falls back for the compressed
+    and uncompressed arms alike.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        chain: GenerationChain | None = None,
+        mode: str | None = None,
+    ) -> None:
+        self.cfg = cfg
         self.settings = cfg.evaluation
+        self.mode = normalise_mode(mode)
+        self.chain = chain or build_generation_chain(
+            cfg,
+            timeout_s=self.settings.timeout_s,
+            num_ctx=self.settings.num_ctx,
+            mode=self.mode,
+        )
 
     def available(self) -> tuple[bool, str]:
-        try:
-            import requests
+        return self.chain.available()
 
-            response = requests.get(f"{self.settings.host}/api/tags", timeout=3)
-            response.raise_for_status()
-            names = [m.get("name", "") for m in response.json().get("models", [])]
-            wanted = self.settings.downstream_model
-            if any(n == wanted or n.split(":")[0] == wanted.split(":")[0] for n in names):
-                return True, ""
-            return False, f"model {wanted!r} not pulled (have: {names or 'none'})"
-        except Exception as exc:
-            return False, f"ollama unreachable at {self.settings.host}: {exc}"
+    @property
+    def label(self) -> str:
+        """``provider:model`` of whoever last answered - for the report header."""
+        name = self.chain.last_provider or self.chain.active_provider_name()
+        provider = next((p for p in self.chain.providers if p.name == name), None)
+        return f"{name}:{provider.model}" if provider else "none"
+
+    @property
+    def is_local(self) -> bool:
+        """Whether the live provider is the local Ollama one.
+
+        Decides whether the ``num_ctx`` truncation guard applies: Ollama
+        silently truncates past its window, hosted models have their own much
+        larger ones and reject rather than truncate.
+        """
+        return (self.chain.active_provider_name() or "") == "local"
 
     def ask(self, context: str, question: str) -> tuple[str, float, int]:
         """Returns (answer, latency_ms, prompt_tokens_reported_by_model)."""
-        import requests
-
         prompt = f"{context}\n\nQuestion: {question}"
         started = time.perf_counter()
-        response = requests.post(
-            f"{self.settings.host}/api/generate",
-            json={
-                "model": self.settings.downstream_model,
-                "system": SYSTEM_PROMPT,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "num_ctx": self.settings.num_ctx,
-                    "num_predict": self.settings.max_answer_tokens,
-                    "temperature": 0,
-                },
-            },
-            timeout=self.settings.timeout_s,
+        answer = self.chain.generate(
+            prompt,
+            max_tokens=self.settings.max_answer_tokens,
+            timeout_s=self.settings.timeout_s,
+            system=SYSTEM_PROMPT,
         )
-        response.raise_for_status()
-        payload = response.json()
         latency_ms = (time.perf_counter() - started) * 1000
-        return (
-            (payload.get("response") or "").strip(),
-            latency_ms,
-            int(payload.get("prompt_eval_count") or 0),
+        # Only the local provider reports its own prompt token count; the
+        # harness counts tokens itself anyway, so 0 is a fine "not reported".
+        active = next(
+            (p for p in self.chain.providers if p.name == self.chain.last_provider),
+            None,
         )
+        reported = int(getattr(active, "last_prompt_tokens", 0) or 0)
+        return answer.strip(), latency_ms, reported
 
 
 class Harness:
-    def __init__(self, cfg: Config | None = None, budget_ratio: float | None = None):
+    def __init__(
+        self,
+        cfg: Config | None = None,
+        budget_ratio: float | None = None,
+        mode: str | None = None,
+        query_aware: bool = True,
+    ):
         self.cfg = cfg or get_config()
+        #: When False the question is withheld from the compressor, which is
+        #: the pre-query-aware behaviour and the control condition for
+        #: measuring what the signal is worth.
+        self.query_aware = query_aware
         self.budget_ratio = (
             budget_ratio if budget_ratio is not None else self.cfg.selection.budget_ratio
         )
+        # One mode for the whole run: the compressor's embeddings and the
+        # answering model must come from the same side of the local/cloud line,
+        # or the latency and cost figures describe a hybrid nobody chose.
+        self.mode = normalise_mode(mode)
         self.tokenizer = get_tokenizer(self.cfg.tokenizer)
-        self.model = DownstreamModel(self.cfg)
-        self.judge = Judge(self.cfg.evaluation)
+        self.model = DownstreamModel(self.cfg, mode=self.mode)
+        self.judge = Judge(self.cfg.evaluation, self.cfg.providers)
         # Stage 6 off: it adds minutes of LLM calls to every compression for no
         # measured token saving on this corpus (see README).
         self.pipeline = CompressionPipeline(
-            self.cfg.with_overrides({"abstractive": {"enabled": False}})
+            self.cfg.with_overrides({"abstractive": {"enabled": False}}),
+            mode=self.mode,
         )
-        self._compressed: dict[str, tuple[str, int, int]] = {}
+        self._compressed: dict[tuple[str, str], tuple[str, int, int]] = {}
 
     # -- compression cache -------------------------------------------------
-    def compressed_context(self, context: EvalContext) -> tuple[str, int, int]:
-        """Compress each context once per run, not once per question."""
-        if context.key not in self._compressed:
+    def compressed_context(
+        self, context: EvalContext, question: str | None = None
+    ) -> tuple[str, int, int]:
+        """Compress a context, cached.
+
+        The cache key includes the question, because with query-aware scoring
+        the compression genuinely differs per question - that is the whole
+        point of the signal. Keying on the context alone would have quietly
+        served one question's compression to all of them and reported a number
+        that no configuration produces.
+
+        With ``query_aware=False`` the question is not passed down, the key
+        collapses back to the context, and this compresses once per context as
+        it did before.
+        """
+        query = (question or "").strip() if self.query_aware else ""
+        key = (context.key, query)
+        if key not in self._compressed:
             result = self.pipeline.compress(
-                context.text, context.name, budget_ratio=self.budget_ratio
+                context.text,
+                context.name,
+                budget_ratio=self.budget_ratio,
+                query=query or None,
             )
-            self._compressed[context.key] = (
+            self._compressed[key] = (
                 result.compressed_text,
                 result.original_tokens,
                 result.compressed_tokens,
             )
-        return self._compressed[context.key]
+        return self._compressed[key]
 
     # -- one condition -----------------------------------------------------
     def _run_one(self, context: str, item: TestItem) -> RunOutcome:
         outcome = RunOutcome(tokens_in=self.tokenizer.count(context))
         try:
             answer, latency_ms, _ = self.model.ask(context, item.question)
+        except NoProviderAvailable:
+            # The whole chain went down mid-run. Every remaining item would
+            # record a 0% recall that reads as "compression destroyed the
+            # facts" rather than "nothing answered", so stop loudly instead of
+            # finishing a run whose numbers mean nothing.
+            raise
         except Exception as exc:
             outcome.error = str(exc)
             return outcome
@@ -194,19 +310,28 @@ class Harness:
         available, reason = self.model.available()
         if not available:
             raise RuntimeError(
-                f"downstream model unavailable: {reason}. "
-                f"Run `ollama pull {self.cfg.evaluation.downstream_model}`."
+                f"no generation provider available: {reason}. Configure a key in "
+                f".env (see .env.example) or start a local Ollama, then re-run. "
+                f"Chain as configured: "
+                f"{' -> '.join(self.cfg.providers.generation_providers)}."
             )
 
         items = testset.items[:limit] if limit else testset.items
         num_ctx = self.cfg.evaluation.num_ctx
+        # The truncation guard exists because Ollama silently truncates past
+        # num_ctx, which would make every "original context" measurement
+        # fiction. Hosted models have their own, much larger windows and reject
+        # an oversized prompt rather than quietly shortening it - so the guard
+        # applies to the local provider only, and applying it regardless would
+        # refuse runs that are perfectly valid on Groq or Gemini.
+        guard_truncation = self.model.is_local
         results: list[ItemResult] = []
         started = time.perf_counter()
 
         for index, item in enumerate(items, start=1):
             context = testset.context_for(item)
             original_tokens = self.tokenizer.count(context.text)
-            if original_tokens > num_ctx:
+            if guard_truncation and original_tokens > num_ctx:
                 # Refuse rather than silently measure a truncated original.
                 raise ValueError(
                     f"{item.id}: original context is {original_tokens:,} tokens but "
@@ -215,7 +340,7 @@ class Harness:
                     f"or shrink the context."
                 )
 
-            compressed_text, _, _ = self.compressed_context(context)
+            compressed_text, _, _ = self.compressed_context(context, item.question)
             print(
                 f"[{index}/{len(items)}] {item.id} ({context.key}) ... ",
                 end="",
@@ -261,7 +386,7 @@ class Harness:
         surviving = total = 0
         for item in items:
             context = testset.context_for(item)
-            compressed_text, _, _ = self.compressed_context(context)
+            compressed_text, _, _ = self.compressed_context(context, item.question)
             present = sum(1 for f in item.key_facts if fact_present(f, compressed_text))
             bucket = by_context.setdefault(
                 item.context_key, {"surviving": 0, "total": 0}
@@ -283,20 +408,213 @@ class Harness:
             ),
         }
 
+    def compare_baselines(self, testset: TestSet, budgets: list[float],
+                          limit: int | None = None) -> dict:
+        """Measured, model-free selection comparison for the deck/demo.
+
+        This intentionally calls the real chunking, redundancy and density
+        stages for every strategy. Only stage 5 is swapped.
+        """
+        items = testset.items[:limit] if limit else testset.items
+        rows: list[dict] = []
+        labels = {"truncate": "naive_truncation", "random": "random_sampling",
+                  "density": "density_based"}
+        for budget in budgets:
+            for strategy, label in labels.items():
+                pipe = CompressionPipeline(self.cfg.with_overrides({"abstractive": {"enabled": False}}))
+                facts = total = 0
+                by_context: dict[str, list[int]] = {}
+                for item in items:
+                    context = testset.context_for(item)
+                    result = pipe.compress(context.text, context.name, budget_ratio=budget,
+                                           fast_mode=True, selection_strategy=strategy)
+                    present = sum(fact_present(f, result.compressed_text) for f in item.key_facts)
+                    facts += present
+                    total += len(item.key_facts)
+                    bucket = by_context.setdefault(context.key, [0, 0])
+                    bucket[0] += present
+                    bucket[1] += len(item.key_facts)
+                rows.append({"strategy": label, "budget_ratio": budget,
+                             "fact_survival_rate": round(facts / total, 4) if total else 0.0,
+                             "facts_surviving": facts, "facts_total": total,
+                             "by_input_type": {
+                                 key: round(v[0] / v[1], 4) if v[1] else 0.0
+                                 for key, v in by_context.items()
+                             },
+                             "accuracy_retention": None,
+                             "accuracy_note": "not run; baseline mode is deterministic by default"})
+        return {"generated_at": datetime.now(timezone.utc).isoformat(),
+                "metric": "deterministic key-fact survival", "seed": 1337,
+                "rows": rows,
+                "note": "Accuracy retention is omitted unless model calls are explicitly added; fact survival isolates selection from retrieval noise."}
+
+    def compare_llmlingua(
+        self, testset: TestSet, budgets: list[float], limit: int | None = None
+    ) -> dict:
+        """Measure LLMLingua-2 on the same corpus, with the same fact metric.
+
+        Truncation and random sampling are strawmen - nobody ships them.
+        LLMLingua is the actual prior art in prompt compression, so "how does
+        this compare to LLMLingua?" is a question worth answering with numbers
+        rather than for the first time on stage.
+
+        Same key-fact survival check, same budgets, same inputs. The only thing
+        that changes is the compressor.
+        """
+        compressor = _load_llmlingua()
+        if compressor is None:
+            return {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "available": False,
+                "reason": (
+                    "llmlingua is not installed (pip install llmlingua), or its "
+                    "model could not be loaded"
+                ),
+                "rows": [],
+            }
+
+        items = testset.items[:limit] if limit else testset.items
+        rows: list[dict] = []
+        for budget in budgets:
+            facts = total = 0
+            tokens_before = tokens_after = 0
+            elapsed = 0.0
+            by_context: dict[str, list[int]] = {}
+            cache: dict[str, str] = {}
+            for item in items:
+                context = testset.context_for(item)
+                if context.key not in cache:
+                    started = time.perf_counter()
+                    out = compressor.compress_prompt(
+                        context.text, rate=budget, force_tokens=["\n", ".", ",", "?"]
+                    )
+                    elapsed += time.perf_counter() - started
+                    cache[context.key] = out["compressed_prompt"]
+                    tokens_before += self.tokenizer.count(context.text)
+                    tokens_after += self.tokenizer.count(cache[context.key])
+                compressed = cache[context.key]
+                present = sum(fact_present(f, compressed) for f in item.key_facts)
+                facts += present
+                total += len(item.key_facts)
+                bucket = by_context.setdefault(context.key, [0, 0])
+                bucket[0] += present
+                bucket[1] += len(item.key_facts)
+            rows.append({
+                "strategy": "llmlingua2",
+                "budget_ratio": budget,
+                "fact_survival_rate": round(facts / total, 4) if total else 0.0,
+                "facts_surviving": facts,
+                "facts_total": total,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "compression_ratio": _ratio(tokens_before, tokens_after),
+                "wall_clock_s": round(elapsed, 1),
+                "by_input_type": {
+                    key: round(v[0] / v[1], 4) if v[1] else 0.0
+                    for key, v in by_context.items()
+                },
+            })
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "available": True,
+            "model": LLMLINGUA_MODEL,
+            "metric": "deterministic key-fact survival (identical to our rows)",
+            "rows": rows,
+            "note": (
+                "LLMLingua-2 is a token-level classifier: it drops individual "
+                "tokens, so its output is not valid code, log or prose and it "
+                "cannot report what it removed. Both properties matter for the "
+                "fact metric and for auditability."
+            ),
+        }
+
+    def compare_providers(
+        self, testset: TestSet, names: list[str], limit: int | None = None
+    ) -> dict:
+        """Cross-provider accuracy report. Each provider runs alone, unchained.
+
+        No fallback here on purpose: the point of the report is to attribute a
+        retention number to a specific model, and a chain that silently
+        substituted a different one would make two rows secretly identical. A
+        provider with no key is reported as skipped, which is information.
+        """
+        items = testset.items[:limit] if limit else testset.items
+        registry = available_providers(self.cfg)
+        rows, skipped = [], []
+        for name in names:
+            provider = registry.get(name)
+            if not provider:
+                skipped.append({"provider": name, "reason": "unknown provider"})
+                continue
+            ok, reason = provider.configured()
+            if not ok:
+                log.warning("%s: %s", name, reason)
+                skipped.append({"provider": name, "reason": reason})
+                continue
+            before = after = 0.0
+            errors: list[str] = []
+            for item in items:
+                context = testset.context_for(item)
+                compressed, _, _ = self.compressed_context(context, item.question)
+                try:
+                    before += key_fact_recall(
+                        provider.generate(
+                            f"{context.text}\n\nQuestion: {item.question}",
+                            max_tokens=self.cfg.evaluation.max_answer_tokens,
+                            system=SYSTEM_PROMPT,
+                        ),
+                        item,
+                    )[0]
+                    after += key_fact_recall(
+                        provider.generate(
+                            f"{compressed}\n\nQuestion: {item.question}",
+                            max_tokens=self.cfg.evaluation.max_answer_tokens,
+                            system=SYSTEM_PROMPT,
+                        ),
+                        item,
+                    )[0]
+                except Exception as exc:
+                    errors.append(f"{item.id}: {exc}")
+                    # A rate-limited or stalled provider has already consumed
+                    # its bounded retry. Stop it rather than multiplying the
+                    # timeout across the remainder of the test set.
+                    break
+            answered = len(items) - len(errors)
+            rows.append({
+                "provider": name,
+                "model": provider.model,
+                "items_answered": answered,
+                "accuracy_before": round(before / answered, 4) if answered else 0,
+                "accuracy_after": round(after / answered, 4) if answered else 0,
+                "accuracy_retention": round(after / before, 4) if before else 0,
+                "errors": errors,
+            })
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "rows": rows,
+            "skipped": skipped,
+            "note": (
+                "Each provider answers alone, with no fallback, so a retention "
+                "number belongs to exactly the model named in its row."
+            ),
+        }
+
     @staticmethod
     def diagnostic_footnote() -> dict:
         """Optional GPT-4o-mini comparison, clearly labelled as a footnote.
 
-        Never a headline number: the shipped pipeline answers locally, and this
-        only indicates *why* the local model missed facts that were present.
+        Never a headline number. It isolates *retrieval* from *compression*: if
+        a stronger model finds a fact the run's provider missed, the fact
+        survived compression and the answer model was the limit.
         """
         base = {
             "label": "GPT-4o-mini retrieval diagnostic",
             "headline_metric": False,
             "affects_shipped_pipeline": False,
             "note": (
-                "Diagnostic only. The shipped pipeline answers with a local "
-                "model and requires no API key."
+                "Diagnostic only, and independent of the provider chain that "
+                "served the run - it exists to separate 'compression lost the "
+                "fact' from 'the answering model missed it'."
             ),
         }
         if not DIAGNOSTIC_REPORT.exists():
@@ -318,6 +636,33 @@ class Harness:
             "aggregate": payload.get("aggregate"),
             "verdict": payload.get("verdict"),
         }
+
+    def _context_summary(self, testset: TestSet) -> dict:
+        """Per-context token figures, averaged over that context's questions.
+
+        With query-aware scoring one context has as many compressions as it has
+        questions, and they legitimately differ. Averaging is the honest
+        summary; the per-item rows below carry the exact numbers.
+        """
+        grouped: dict[str, list[tuple[int, int]]] = {}
+        for (context_key, _query), (_text, original, compressed) in self._compressed.items():
+            grouped.setdefault(context_key, []).append((original, compressed))
+
+        summary: dict[str, dict] = {}
+        for context_key, pairs in grouped.items():
+            original = round(statistics.mean(p[0] for p in pairs))
+            compressed = round(statistics.mean(p[1] for p in pairs))
+            entry = {
+                "source": testset.contexts[context_key].source,
+                "original_tokens": original,
+                "compressed_tokens": compressed,
+                "compression_ratio": _ratio(original, compressed),
+            }
+            if len(pairs) > 1:
+                entry["compressions"] = len(pairs)
+                entry["note"] = "mean over this context's per-question compressions"
+            summary[context_key] = entry
+        return summary
 
     # -- reporting ---------------------------------------------------------
     def _report(
@@ -389,27 +734,35 @@ class Harness:
             "wall_clock_s": round(wall_clock_s, 1),
             "config": {
                 "test_set": testset.name,
-                "downstream_model": self.cfg.evaluation.downstream_model,
+                # Whichever chain entry actually answered, not whichever was
+                # configured first. With a fallback chain those differ, and a
+                # report that names the wrong model is a report that lies.
+                "downstream_model": self.model.label,
+                "mode": self.mode,
+                "generation_chain": self.cfg.providers.generation_providers,
+                "generation_provider": self.model.chain.last_provider,
+                "generation_attempts": [
+                    a.to_dict() for a in self.model.chain.last_attempts
+                ],
+                "embedding_chain": [self.cfg.providers.embedding_provider]
+                + list(self.cfg.providers.embedding_fallback),
+                "embedding_provider": self.pipeline.embedder.stats.provider,
                 "num_ctx": self.cfg.evaluation.num_ctx,
                 "judge": self.judge.describe,
                 "accuracy_metric": "key_fact_recall",
                 "budget_ratio": self.budget_ratio,
                 "pricing_model": self.cfg.evaluation.pricing_model,
+                "query_aware": self.query_aware,
                 "abstractive_enabled": False,
                 "tokenizer_exact": self.tokenizer.is_exact,
             },
             "aggregate": aggregate,
             "fact_survival": survival,
             "diagnostic": self.diagnostic_footnote(),
-            "contexts": {
-                key: {
-                    "source": testset.contexts[key].source,
-                    "original_tokens": original,
-                    "compressed_tokens": compressed,
-                    "compression_ratio": _ratio(original, compressed),
-                }
-                for key, (_, original, compressed) in self._compressed.items()
-            },
+            # The cache is keyed (context, question) since query-aware scoring
+            # makes the compression question-dependent. Report per context,
+            # averaging the per-question compressions of each one.
+            "contexts": self._context_summary(testset),
             "items": [
                 {
                     "id": r.id,
@@ -439,7 +792,9 @@ def finalize(report: dict, harness: "Harness", testset: TestSet) -> dict:
         item = next((i for i in testset.items if i.id == entry["id"]), None)
         if item is None:
             continue
-        compressed_text, _, _ = harness.compressed_context(testset.context_for(item))
+        compressed_text, _, _ = harness.compressed_context(
+            testset.context_for(item), item.question
+        )
         present = sum(1 for f in item.key_facts if fact_present(f, compressed_text))
         entry["facts_present_in_compressed"] = f"{present}/{len(item.key_facts)}"
     report["fact_survival"] = survival
@@ -557,6 +912,18 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the 14.5k-token log context (the slow one)",
     )
     parser.add_argument("--config", help="alternate config.yaml")
+    parser.add_argument(
+        "--no-query", action="store_true",
+        help="withhold the question from the compressor (query-blind control "
+             "condition, i.e. the behaviour before query-aware scoring)",
+    )
+    parser.add_argument("--compare-baselines", action="store_true",
+                        help="write deterministic density vs truncation/random report")
+    parser.add_argument("--with-llmlingua", action="store_true",
+                        help="also measure LLMLingua-2 on the same corpus and "
+                             "metric (needs `pip install llmlingua`; downloads "
+                             "a ~700 MB model on first use)")
+    parser.add_argument("--providers", help="comma-separated evaluation providers: local,groq,gemini,openrouter")
     parser.add_argument("--out", help="report directory (default: reports/)")
     parser.add_argument(
         "--finalize",
@@ -573,7 +940,32 @@ def main(argv: list[str] | None = None) -> int:
         testset.items = [i for i in testset.items if i.context_key != "log_incident"]
         print(f"--quick: {len(testset.items)} items (log_incident skipped)")
 
-    harness = Harness(get_config(args.config), args.budget)
+    harness = Harness(
+        get_config(args.config), args.budget, query_aware=not args.no_query
+    )
+
+    if args.compare_baselines:
+        report = harness.compare_baselines(testset, [0.15, 0.30, 0.50], args.limit)
+        if args.with_llmlingua:
+            report["llmlingua"] = harness.compare_llmlingua(
+                testset, [0.15, 0.30, 0.50], args.limit
+            )
+        output = Path(args.out) if args.out else REPORTS_DIR
+        output.mkdir(parents=True, exist_ok=True)
+        path = output / BASELINE_REPORT.name
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(json.dumps(report["rows"], indent=2))
+        print(f"wrote {path}")
+        return 0
+
+    if args.providers:
+        report = harness.compare_providers(testset, [p.strip() for p in args.providers.split(",") if p.strip()], args.limit)
+        output = Path(args.out) if args.out else REPORTS_DIR
+        output.mkdir(parents=True, exist_ok=True)
+        path = output / "provider_comparison.json"
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(json.dumps(report, indent=2)); print(f"wrote {path}")
+        return 0
 
     if args.finalize:
         path = REPORTS_DIR / "latest.json"

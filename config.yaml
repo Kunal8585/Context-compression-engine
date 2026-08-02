@@ -39,7 +39,29 @@ redundancy:
   enabled: true
   model: sentence-transformers/all-MiniLM-L6-v2
   # Cosine similarity at or above this merges two chunks into one cluster.
+  # Fallback for any provider not calibrated below.
   similarity_threshold: 0.88
+
+  # Cosine is NOT a shared scale across embedding models, and getting this
+  # wrong fails silently rather than loudly. Measured on the same 26
+  # near-duplicate support tickets:
+  #
+  #   provider   max pair   pairs >= 0.88   pairs >= 0.84
+  #   local        0.908          7              ~20
+  #   cohere       0.877          0                5
+  #
+  # Cohere's *most similar* pair sits below the MiniLM-calibrated default, so
+  # applying 0.88 to it disables the fuzzy pass entirely - no error, just a
+  # stage that quietly stops collapsing anything. Hence per-provider values.
+  #
+  # Only providers measured on this corpus are listed. gemini and openai were
+  # rate-limited during calibration and are deliberately ABSENT rather than
+  # guessed: an uncalibrated provider falls back to the default above and the
+  # stage note says so, which is the honest failure mode.
+  # Recalibrate with: python -m engine.inspect_redundancy <file> --sweep
+  similarity_threshold_by_provider:
+    local: 0.88
+    cohere: 0.84
   # Byte-identical (post-normalisation) chunks are collapsed without needing
   # the embedding model - cheap and works even if sentence-transformers fails.
   exact_hash_dedup: true
@@ -69,11 +91,22 @@ density:
   # 78/146. Rarity (tfidf, novelty) and severity (structure) predict "this
   # answers a question about the incident"; raw entity counts do not.
   weights:
-    entropy: 0.15         # token-level Shannon entropy - detects repetitive filler
-    tfidf: 0.25           # rarity of the chunk's terms across the document
-    entities: 0.15        # named entities, numbers, identifiers, signatures
-    novelty: 0.20         # distance from the corpus centroid (see density.py)
-    structure: 0.25       # severity, failure vocabulary, signatures, headings
+    entropy: 0.12         # token-level Shannon entropy - detects repetitive filler
+    tfidf: 0.20           # rarity of the chunk's terms across the document
+    entities: 0.12        # named entities, numbers, identifiers, signatures
+    novelty: 0.16         # distance from the corpus centroid (see density.py)
+    structure: 0.20       # severity, failure vocabulary, signatures, headings
+    # Cosine similarity to the user's question. Only applies when a query is
+    # supplied; otherwise its weight is redistributed over the five above and
+    # scoring is identical to a query-less run.
+    #
+    # This is the difference between "which chunks are informative?" and
+    # "which chunks answer THIS question?". Without it the engine is
+    # query-blind: the same 100k-token log compresses identically whether you
+    # asked about pool size or rollback timing. Weighted highest of the six
+    # because when a question exists it is the only signal that knows what the
+    # output is *for*.
+    query_relevance: 0.20
   spacy_model: en_core_web_sm
   # Above this many characters, skip spaCy and use the regex entity proxies -
   # loading NER for 400k chars of log text is not worth the wall-clock. The
@@ -176,21 +209,94 @@ selection:
   # lands under budget rather than just over it.
   marker_reserve: 0.03
 
+# ---------------------------------------------------------------------------
+# MODEL PROVIDERS - the block to read when asked "what is actually running
+# this right now?"
+#
+# Every model call in the project goes through one of the two chains below.
+# They are walked top to bottom: a provider whose API key is not configured is
+# SKIPPED (not an error), a provider that fails or times out is recorded and
+# the chain moves on. Only when every entry is exhausted does anything raise,
+# and the message names each provider and why it was passed over.
+#
+# `GET /health` reports which entry is live right now, so the answer to that
+# question is observable, not just declared. `CCE_OFFLINE=1` collapses both
+# chains to their local entries - no network, no keys, no quota.
+#
+# Keys are read from the environment ONLY (see .env.example). Nothing here is
+# a secret and nothing here is ever echoed into a response.
+# ---------------------------------------------------------------------------
+providers:
+  # --- stage 3: embeddings -------------------------------------------------
+  # openai | gemini | cohere | local
+  #
+  # NOTE ON FALLING BACK MID-CHAIN: vectors from different providers are not
+  # comparable (1536 / 768 / 1024 / 384 dimensions, different spaces), so one
+  # provider serves an entire document. The chain re-walks on the next call,
+  # never inside one.
+  # MEASURED: local leads because it wins on the job, not out of caution.
+  # On tickets.txt (26 near-duplicate support tickets) MiniLM collapsed 4
+  # chunks; Cohere collapsed 0. Fact survival was 96.2% local vs 88.5% via the
+  # cloud chain. It is also free, rate-limit-proof, and has no network leg.
+  # The cloud entries stay as fallbacks - if the MiniLM weights are missing on
+  # a fresh checkout the chain still resolves.
+  embedding_provider: local
+  embedding_fallback: [cohere, gemini, openai]
+
+  # --- stage 6 + eval harness: generation ----------------------------------
+  # Ordered by "free and fast" first, quality baseline next, local last.
+  # groq is far the quickest of the hosted options; local always answers.
+  generation_providers: [groq, gemini, openai, local]
+
+  # Default per-request HTTP timeout. Callers tighten it: stage 6 uses a 10s
+  # per-call ceiling so a live /compress can never stall on a paraphrase.
+  timeout_s: 30
+  # How long a failed provider sits out before the chain retries it. Long
+  # enough that a 12-chunk stage does not pay the same timeout twelve times,
+  # short enough that a brief rate-limit does not cost the provider all day.
+  cooldown_s: 60
+  local_host: http://localhost:11434
+
+  # Model identifiers per provider and role. Names only - never keys.
+  models:
+    openai_embedding: text-embedding-3-small     # 1536-d, $0.02/1M tokens
+    # NOTE: text-embedding-004 was retired - it 404s on :embedContent. Verify
+    # the current name with:
+    #   curl -H "x-goog-api-key: $GOOGLE_API_KEY" \
+    #     https://generativelanguage.googleapis.com/v1beta/models
+    gemini_embedding: gemini-embedding-001        # 3072-d, free tier
+    cohere_embedding: embed-english-v3.0         # 1024-d, free trial key
+    local_embedding: sentence-transformers/all-MiniLM-L6-v2   # 384-d, free
+
+    groq_generation: llama-3.3-70b-versatile     # free tier, fastest
+    gemini_generation: gemini-2.0-flash          # free tier (low daily quota)
+    openai_generation: gpt-4o-mini               # paid, quality baseline
+    # Which OpenRouter models carry the `:free` tag rotates month to month, and
+    # a retired slug 404s. $OPENROUTER_MODEL overrides this at runtime; list the
+    # current free set with:
+    #   curl -s https://openrouter.ai/api/v1/models | jq -r '.data[].id' | grep ':free'
+    #
+    # CAVEAT: most of the currently-free slugs are reasoning models that return
+    # 200 with an empty `content` and everything in `reasoning`. The provider
+    # treats that as a failure so the chain falls through rather than accepting
+    # an empty answer. Verify a slug before relying on it. Not in the default
+    # chain for this reason.
+    openrouter_generation: nvidia/nemotron-3-nano-30b-a3b:free
+    local_generation: llama3.2:3b                # ollama, no key, no network
+
 abstractive:
-  # Stage 6 is strictly optional. If Ollama is not running the pipeline logs a
-  # skip and continues - it must never break a live demo.
+  # Stage 6 is strictly optional. If no generation provider in the chain can
+  # run, the pipeline logs a skip and continues - it must never break a demo.
   #
   # MEASURED on this corpus (llama3.2:3b, M2): 3-6 s per chunk, and on the
   # postmortem it saved 0 tokens - the one paraphrase attempted was correctly
   # rejected for dropping a timeline entry (10:41). The mechanism does work
   # (a verbose prose chunk compressed 188 -> 111 tokens at 100% critical-token
   # retention) but stage 5 drops exactly those verbose chunks first, so little
-  # of what survives selection is safely compressible. Use `fast_mode: true`
-  # for the live judge path; see README.
+  # of what survives selection is safely compressible. See README for whether
+  # a stronger hosted model changes this; use `fast_mode: true` for the live
+  # judge path either way.
   enabled: true
-  provider: ollama
-  model: llama3.2:3b
-  host: http://localhost:11434
   # Only paraphrase chunks above this size; below it the LLM call costs more
   # tokens than it saves.
   min_tokens_to_compress: 150
@@ -214,11 +320,13 @@ reconstruction:
   cluster_markers: true
 
 evaluation:
-  downstream_model: llama3.2:3b
-  host: http://localhost:11434
+  # The model that answers is whichever entry in providers.generation_providers
+  # is live; every report records the one that actually served the run.
+  #
   # Ollama defaults to a 2048-token context and silently truncates past it -
   # which would make every "original context" measurement fiction. Set high
   # enough to hold the largest uncompressed eval context (14.5k tokens).
+  # Applies to the local provider only; hosted models have their own windows.
   num_ctx: 16384
   max_answer_tokens: 120
   timeout_s: 300

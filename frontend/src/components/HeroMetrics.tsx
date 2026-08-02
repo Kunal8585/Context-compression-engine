@@ -107,11 +107,21 @@ export function HeroMetrics({ report }: { report: EvaluateResponse }) {
           format={(n) => `${n.toFixed(2)}×`}
           detail={`${(a.latency_before_ms / 1000).toFixed(0)}s → ${(a.latency_after_ms / 1000).toFixed(0)}s`}
         />
+        {/* Fact survival, not accuracy retention.
+
+            Retention is a joint verdict on the compressor AND the answering
+            model — a small model that cannot find a fact sitting in its own
+            context drags it down while saying nothing about what compression
+            removed. Fact survival is the compressor's own number: measured
+            deterministically, no model involved. It is also the ceiling
+            retention is bounded by, so it is the more informative headline.
+            Retention is still shown, in the panel below, where it can be
+            explained rather than mistaken for a compression metric. */}
         <Card
-          label="Accuracy retention"
-          value={a.accuracy_retention}
+          label="Key facts preserved"
+          value={report.fact_survival.overall}
           format={pct}
-          detail={`${pct(a.accuracy_before)} → ${pct(a.accuracy_after)} key-fact recall`}
+          detail={`${report.fact_survival.facts_surviving}/${report.fact_survival.facts_total} facts · no model involved`}
           onClick={() => setOpen((v) => !v)}
           expanded={open}
         />
@@ -137,18 +147,25 @@ export function HeroMetrics({ report }: { report: EvaluateResponse }) {
                 </span>{" "}
                 of key facts survive compression (
                 {report.fact_survival.facts_surviving}/
-                {report.fact_survival.facts_total}) — the compressor&apos;s
-                ceiling. The local {report.config.downstream_model} model
-                retrieves{" "}
+                {report.fact_survival.facts_total}), measured by checking the
+                compressed text directly — <strong>no model is asked
+                anything</strong>, so this number is the compressor&apos;s own
+                and is reproducible exactly.
+              </p>
+              <p className="mt-3 text-base leading-relaxed text-neutral-300">
+                Downstream <strong>accuracy retention</strong> is{" "}
                 <span className="font-mono text-amber-400">
-                  {pct(a.accuracy_after)}
+                  {pct(a.accuracy_retention)}
                 </span>{" "}
-                of those facts when answering — this is the measured
-                bottleneck, not information loss.
+                ({pct(a.accuracy_before)} → {pct(a.accuracy_after)} key-fact
+                recall against {report.config.downstream_model}). It is bounded
+                by the number above: the compressor cannot preserve more than
+                it preserved, and the answering model cannot retrieve more than
+                the compressor kept. Where the two differ, the gap is
+                retrieval, not information loss.
               </p>
               <p className="mt-3 text-sm text-neutral-500">
-                For reference the same model scores {pct(a.accuracy_before)} on
-                the full uncompressed context, so it is imperfect either way.
+                Both are reported because they answer different questions.
                 Accuracy metric: {report.config.accuracy_metric}.
               </p>
             </div>

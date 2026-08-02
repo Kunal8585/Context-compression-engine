@@ -17,8 +17,19 @@ export function DiffView({
   result: CompressResponse;
 }) {
   const segments = useMemo(() => {
-    const out: Array<{ text: string; kept: boolean; key: string }> = [];
+    const out: Array<{
+      text: string;
+      kept: boolean;
+      key: string;
+      source?: string;
+      /** Only the first span of each file carries a badge — see below. */
+      showBadge?: boolean;
+    }> = [];
     let cursor = 0;
+    // A badge on every span would put one in front of every paragraph of a
+    // single-file upload. What a reader actually needs is the point where
+    // provenance *changes*, so the badge marks transitions between files.
+    let lastSource: string | undefined;
     result.spans.forEach((span, index) => {
       if (span.start > cursor) {
         // Whitespace between chunks - keep it so line numbers stay honest.
@@ -28,11 +39,15 @@ export function DiffView({
           key: `gap-${index}`,
         });
       }
+      const source = span.source_file;
       out.push({
         text: original.slice(span.start, span.end),
         kept: span.kept,
         key: `span-${index}`,
+        source,
+        showBadge: Boolean(source) && source !== lastSource,
       });
+      if (source) lastSource = source;
       cursor = Math.max(cursor, span.end);
     });
     if (cursor < original.length) {
@@ -45,6 +60,10 @@ export function DiffView({
   const droppedTokens = result.spans
     .filter((s) => !s.kept)
     .reduce((total, s) => total + s.tokens, 0);
+  const sourceFiles = useMemo(
+    () => [...new Set(result.spans.map((s) => s.source_file).filter(Boolean))],
+    [result.spans],
+  );
 
   return (
     <section>
@@ -64,21 +83,27 @@ export function DiffView({
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Pane
           title="Original"
-          meta={`${summary.chunks_total} chunks · ${summary.original_tokens.toLocaleString()} tokens`}
+          meta={
+            sourceFiles.length > 1
+              ? `${sourceFiles.length} files · ${summary.chunks_total} chunks · ${summary.original_tokens.toLocaleString()} tokens`
+              : `${summary.chunks_total} chunks · ${summary.original_tokens.toLocaleString()} tokens`
+          }
         >
-          {segments.map((segment) =>
-            segment.kept ? (
-              <span key={segment.key}>{segment.text}</span>
-            ) : (
-              <span
-                key={segment.key}
-                title="dropped by the budget selector"
-                className="bg-red-950/30 text-neutral-600 line-through decoration-neutral-700"
-              >
-                {segment.text}
-              </span>
-            ),
-          )}
+          {segments.map((segment) => (
+            <span key={segment.key} title={segment.source}>
+              {segment.showBadge && <SourceBadge name={segment.source!} />}
+              {segment.kept ? (
+                segment.text
+              ) : (
+                <span
+                  title="dropped by the budget selector"
+                  className="bg-red-950/30 text-neutral-600 line-through decoration-neutral-700"
+                >
+                  {segment.text}
+                </span>
+              )}
+            </span>
+          ))}
         </Pane>
 
         <Pane
@@ -107,8 +132,26 @@ export function DiffView({
         dropped ({droppedTokens.toLocaleString()} tokens) ·{" "}
         <span className="text-amber-500/80">[markers]</span> state what was
         removed, so the prompt is auditable
+        {sourceFiles.length > 1 && (
+          <>
+            {" · "}
+            <span className="rounded bg-neutral-800 px-1 text-[9px] text-neutral-400">
+              file.ext
+            </span>{" "}
+            badges mark where each uploaded file begins
+          </>
+        )}
       </p>
     </section>
+  );
+}
+
+/** Provenance tag shown where the source file changes in a multi-file upload. */
+function SourceBadge({ name }: { name: string }) {
+  return (
+    <span className="mr-1 rounded bg-neutral-800 px-1 align-middle text-[9px] text-neutral-400">
+      {name}
+    </span>
   );
 }
 

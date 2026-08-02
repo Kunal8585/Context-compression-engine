@@ -127,7 +127,10 @@ class DensityScorer:
 
     # -- public API --------------------------------------------------------
     def run(
-        self, chunks: list[Chunk], embeddings: np.ndarray | None = None
+        self,
+        chunks: list[Chunk],
+        embeddings: np.ndarray | None = None,
+        query_embedding: np.ndarray | None = None,
     ) -> DensityResult:
         started = time.perf_counter()
         tokens = sum(c.token_count for c in chunks)
@@ -193,6 +196,42 @@ class DensityScorer:
         raw["structure"] = np.array(
             [self._structure(chunk) for chunk in chunks], dtype=np.float64
         )
+
+        # --- signal 6: query relevance ---
+        #
+        # Without this the scorer is query-blind: compressing a 100k-token log
+        # produces the same output whether the question is "what was the pool
+        # size?" or "when did the rollback start?". The protected-chunk
+        # mechanism keeps the *question* from being dropped but says nothing
+        # about which context is relevant to it, which is the part that
+        # actually decides whether the answer survives.
+        #
+        # Deliberately unavailable when no query was supplied, so a query-less
+        # compression scores identically to before this signal existed - the
+        # weight is redistributed, not silently applied as zero.
+        if query_embedding is None or embeddings is None:
+            unavailable.append("query_relevance")
+            details["query_relevance_note"] = (
+                "no query supplied; weight redistributed over the other signals"
+                if query_embedding is None
+                else "no embeddings supplied by stage 3"
+            )
+        elif len(embeddings) != len(chunks):
+            unavailable.append("query_relevance")
+            details["query_relevance_note"] = "embedding/chunk count mismatch"
+        elif np.asarray(query_embedding).reshape(-1).shape[0] != embeddings.shape[1]:
+            # Belt and braces: the pipeline already refuses to hand over a
+            # query embedded by a different provider, but a dot product across
+            # two vector spaces is a crash rather than a bad score, so the
+            # dimension is checked at the point of use as well.
+            unavailable.append("query_relevance")
+            details["query_relevance_note"] = (
+                f"query embedding is {np.asarray(query_embedding).reshape(-1).shape[0]}-d "
+                f"but chunks are {embeddings.shape[1]}-d; different providers"
+            )
+        else:
+            raw["query_relevance"] = self._query_relevance(embeddings, query_embedding)
+            details["query_relevance"] = "scored against the supplied query"
 
         # --- combine ---
         weights = self._effective_weights(unavailable)
@@ -319,6 +358,23 @@ class DensityScorer:
             values = matrix.data[start:end]
             scores[row] = float(values.mean()) if values.size else 0.0
         return scores, None
+
+    @staticmethod
+    def _query_relevance(
+        embeddings: np.ndarray, query_embedding: np.ndarray
+    ) -> np.ndarray:
+        """Cosine similarity between each chunk and the question.
+
+        Both sides are L2-normalised by :mod:`engine.embeddings`, so this is a
+        dot product. Cosine lands in [-1, 1]; it is mapped to [0, 1] here
+        rather than clipped, because a chunk that is merely *unrelated* to the
+        question (~0) and one that is semantically opposed (<0) should not
+        collapse to the same score - the second is a stronger signal that the
+        chunk is not what was asked about.
+        """
+        query = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        similarity = embeddings @ query
+        return ((similarity + 1.0) / 2.0).astype(np.float64)
 
     @staticmethod
     def _novelty(embeddings: np.ndarray) -> np.ndarray:

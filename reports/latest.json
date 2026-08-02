@@ -1,63 +1,153 @@
 {
-  "report_id": "2026-08-01T10:30:20Z",
-  "generated_at": "2026-08-01T10:30:20.796554+00:00",
-  "wall_clock_s": 842.9,
+  "report_id": "2026-08-02T08:03:53Z",
+  "generated_at": "2026-08-02T08:03:53.234356+00:00",
+  "wall_clock_s": 404.6,
   "config": {
     "test_set": "default",
-    "downstream_model": "llama3.2:3b",
+    "downstream_model": "local:llama3.2:3b",
+    "mode": "auto",
+    "generation_chain": [
+      "groq",
+      "gemini",
+      "openai",
+      "local"
+    ],
+    "generation_provider": "local",
+    "generation_attempts": [
+      {
+        "provider": "groq",
+        "ok": false,
+        "skipped": true,
+        "reason": "in cooldown for another 51s",
+        "duration_ms": 0.0
+      },
+      {
+        "provider": "gemini",
+        "ok": false,
+        "skipped": true,
+        "reason": "in cooldown for another 51s",
+        "duration_ms": 0.0
+      },
+      {
+        "provider": "openai",
+        "ok": false,
+        "skipped": true,
+        "reason": "in cooldown for another 52s",
+        "duration_ms": 0.0
+      },
+      {
+        "provider": "local",
+        "ok": true,
+        "skipped": false,
+        "reason": "",
+        "duration_ms": 3858.7
+      }
+    ],
+    "embedding_chain": [
+      "openai",
+      "gemini",
+      "cohere",
+      "local"
+    ],
+    "embedding_provider": "cohere",
     "num_ctx": 16384,
-    "judge": "none (key-fact recall only)",
+    "judge": "none (openai judge failed 3 times in a row; disabled for this run)",
     "accuracy_metric": "key_fact_recall",
     "budget_ratio": 0.3,
     "pricing_model": "gpt-4o-mini",
+    "query_aware": true,
     "abstractive_enabled": false,
     "tokenizer_exact": true
   },
   "aggregate": {
     "items": 15,
-    "compression_ratio": 0.7145,
+    "compression_ratio": 0.7149,
     "tokens_before": 88664,
-    "tokens_after": 25317,
-    "cost_before_usd": 0.013608,
-    "cost_after_usd": 0.003957,
-    "cost_reduction": 0.7092,
-    "latency_before_ms": 640663.5,
-    "latency_after_ms": 158052.8,
-    "latency_speedup": 4.053,
-    "accuracy_before": 0.9,
-    "accuracy_after": 0.5667,
-    "accuracy_retention": 0.6296,
+    "tokens_after": 25282,
+    "cost_before_usd": 0.013594,
+    "cost_after_usd": 0.004044,
+    "cost_reduction": 0.7025,
+    "latency_before_ms": 255526.5,
+    "latency_after_ms": 83524.8,
+    "latency_speedup": 3.059,
+    "accuracy_before": 0.9333,
+    "accuracy_after": 0.8,
+    "accuracy_retention": 0.8571,
+    "fact_survival_rate": 0.8846,
     "verdicts": {
-      "retained": 10,
+      "retained": 13,
       "improved": 0,
-      "degraded": 5
+      "degraded": 2
+    }
+  },
+  "fact_survival": {
+    "overall": 0.8846,
+    "facts_surviving": 23,
+    "facts_total": 26,
+    "by_context": {
+      "log_incident": {
+        "surviving": 8,
+        "total": 8,
+        "rate": 1.0
+      },
+      "postmortem": {
+        "surviving": 6,
+        "total": 8,
+        "rate": 0.75
+      },
+      "auth_code": {
+        "surviving": 6,
+        "total": 7,
+        "rate": 0.8571
+      },
+      "tickets": {
+        "surviving": 3,
+        "total": 3,
+        "rate": 1.0
+      }
     },
-    "fact_survival_rate": 0.8077
+    "note": "Deterministic: no model involved. This is the compressor's own ceiling - downstream accuracy is bounded by it."
+  },
+  "diagnostic": {
+    "label": "GPT-4o-mini retrieval diagnostic",
+    "headline_metric": false,
+    "affects_shipped_pipeline": false,
+    "note": "Diagnostic only, and independent of the provider chain that served the run - it exists to separate 'compression lost the fact' from 'the answering model missed it'.",
+    "available": false,
+    "reason": "not run - optional, requires OPENAI_API_KEY with available credits (python -m diagnostic.gpt4o_mini_check)"
   },
   "contexts": {
     "log_incident": {
       "source": "logs/checkout_service.log",
       "original_tokens": 14524,
-      "compressed_tokens": 4191,
-      "compression_ratio": 0.7114
+      "compressed_tokens": 4197,
+      "compression_ratio": 0.711,
+      "compressions": 5,
+      "note": "mean over this context's per-question compressions"
     },
     "postmortem": {
       "source": "docs/incident_postmortem.md",
       "original_tokens": 1401,
-      "compressed_tokens": 397,
-      "compression_ratio": 0.7166
+      "compressed_tokens": 378,
+      "compression_ratio": 0.7302,
+      "compressions": 4,
+      "note": "mean over this context's per-question compressions"
     },
     "auth_code": {
       "source": "code/auth_service.py",
       "original_tokens": 1952,
-      "compressed_tokens": 508,
-      "compression_ratio": 0.7398
+      "compressed_tokens": 538,
+      "compression_ratio": 0.7244,
+      "compressions": 4,
+      "note": "mean over this context's per-question compressions"
     },
     "tickets": {
       "source": "support/tickets.txt",
       "original_tokens": 1316,
-      "compressed_tokens": 371,
-      "compression_ratio": 0.7181
+      "compressed_tokens": 318,
+      "compression_ratio": 0.7584,
+      "compressions": 2,
+      "note": "mean over this context's per-question compressions"
     }
   },
   "items": [
@@ -71,54 +161,49 @@
         "answer": "The configuration value that caused the incident is `PAYMENT_POOL_SIZE`. It was resolved to 8.",
         "tokens_in": 14524,
         "tokens_out": 21,
-        "latency_ms": 75164.44045800017,
+        "latency_ms": 13280.474957995466,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "The configuration value that caused the incident is `PAYMENT_POOL_SIZE`, and it was resolved to `8`.",
-        "tokens_in": 4191,
-        "tokens_out": 22,
-        "latency_ms": 15566.47462500041,
+        "answer": "The configuration value that caused the incident is `PAYMENT_POOL_SIZE`, and it was resolved to `8` (manifest override absent).",
+        "tokens_in": 4317,
+        "tokens_out": 27,
+        "latency_ms": 16947.787292010617,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "log-02",
       "context": "log_incident",
       "question": "What exception type was raised in the charge path, and against which host?",
       "expected_answer": "requests.exceptions.ReadTimeout against payments.internal.",
-      "verdict": "degraded",
+      "verdict": "retained",
       "original": {
         "answer": "The exception type that was raised in the charge path is a `requests.exceptions.ReadTimeout` exception. This exception was raised against the `payments.internal` host.",
         "tokens_in": 14524,
         "tokens_out": 32,
-        "latency_ms": 123086.26366700264,
+        "latency_ms": 72175.91479199473,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "NOT FOUND.",
-        "tokens_in": 4191,
-        "tokens_out": 3,
-        "latency_ms": 22449.25945799696,
-        "recall": 0.0,
-        "missing_facts": [
-          "ReadTimeout/Read timed out",
-          "payments.internal"
-        ],
+        "answer": "The exception type raised in the charge path was a `requests.exceptions.ReadTimeout`, and it occurred against the host `payments.internal` on port `443`.",
+        "tokens_in": 4116,
+        "tokens_out": 31,
+        "latency_ms": 742.4231669865549,
+        "recall": 1.0,
+        "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "log-03",
@@ -130,23 +215,22 @@
         "answer": "The read timeout for the HTTPSConnectionPool was set to 8 seconds. However, the actual time it took for a gateway call to wait and then timeout is not explicitly stated in the provided context. It can be inferred that some of the gateway calls timed out after 8000ms (or approximately 2.5 minutes), but this value is not consistently mentioned throughout the log entries.",
         "tokens_in": 14524,
         "tokens_out": 78,
-        "latency_ms": 112678.39512499995,
+        "latency_ms": 5445.641958009219,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "The gateway calls waited for 8000ms (8 seconds) before timing out.",
-        "tokens_in": 4191,
-        "tokens_out": 17,
-        "latency_ms": 23818.227875002776,
+        "answer": "The context does not explicitly state the exact time (in milliseconds) that gateway calls waited before timing out. However, it is mentioned in multiple places that the timeout period was 8000ms (8 seconds). \n\nFor example:\n\n- \"gateway timeout after 8000ms order=ORD-269615 attempt=3 idempotency_key=ORD-269615:3\"\n- \"gateway timeout after 8000ms order=ORD-348962 attempt=3 idempotency_key=ORD-348962:3\"\n- \"gateway timeout after 8000ms order=ORD",
+        "tokens_in": 4143,
+        "tokens_out": 120,
+        "latency_ms": 35652.08333299961,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "1/1"
+      }
     },
     {
       "id": "log-04",
@@ -158,23 +242,22 @@
         "answer": "The rollback target was v2.30.4.",
         "tokens_in": 14524,
         "tokens_out": 11,
-        "latency_ms": 106384.95212500129,
+        "latency_ms": 117537.35766699538,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "The rollback target was v2.30.4.",
-        "tokens_in": 4191,
-        "tokens_out": 11,
-        "latency_ms": 24506.270582998695,
+        "answer": "v2.30.4",
+        "tokens_in": 4230,
+        "tokens_out": 6,
+        "latency_ms": 869.2667090072064,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "1/1"
+      }
     },
     {
       "id": "log-05",
@@ -186,7 +269,7 @@
         "answer": "The recorded connection pool wait time was 7912ms. The pool's in-use value was 8, and its size value was also 8 when it was exceeded.",
         "tokens_in": 14524,
         "tokens_out": 35,
-        "latency_ms": 102126.73891699887,
+        "latency_ms": 3100.042250007391,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
@@ -194,15 +277,14 @@
       },
       "compressed": {
         "answer": "The recorded connection pool wait time was 7912ms. The pool's in-use value was 8, and its size value was also 8 when it was exceeded.",
-        "tokens_in": 4191,
+        "tokens_in": 4177,
         "tokens_out": 35,
-        "latency_ms": 30119.07770799735,
+        "latency_ms": 16078.516917012166,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "doc-01",
@@ -214,17 +296,17 @@
         "answer": "According to the context, p99 latency for `POST /v1/checkout` rose from 240 ms to 8.4 s.",
         "tokens_in": 1401,
         "tokens_out": 29,
-        "latency_ms": 9029.998499998328,
+        "latency_ms": 6412.690209006541,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "NOT FOUND. The context does not provide information on the original p99 latency value or its change.",
-        "tokens_in": 397,
-        "tokens_out": 20,
-        "latency_ms": 3680.0144579974585,
+        "answer": "NOT FOUND. The context does not provide the initial value of p99 latency for POST /v1/checkout.",
+        "tokens_in": 398,
+        "tokens_out": 23,
+        "latency_ms": 2937.2737079975195,
         "recall": 0.0,
         "missing_facts": [
           "240 ms/240ms/240",
@@ -232,8 +314,7 @@
         ],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "0/2"
+      }
     },
     {
       "id": "doc-02",
@@ -245,85 +326,76 @@
         "answer": "Approximately 14,200 checkout attempts were affected. The estimated revenue impact is $86,000 based on the average order value of $19.10 and a 33% recovery rate on retried carts.",
         "tokens_in": 1401,
         "tokens_out": 43,
-        "latency_ms": 12540.784499997244,
+        "latency_ms": 10865.748290991178,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "Approximately 14,200 checkout attempts were affected. The estimated revenue impact is $86,000 based on an average order value of $19.10 and a 33% recovery rate on retried carts.",
-        "tokens_in": 397,
-        "tokens_out": 43,
-        "latency_ms": 7140.573167002003,
+        "answer": "Checkout attempts affected: 14,200.\n\nEstimated revenue impact: $86,000.",
+        "tokens_in": 372,
+        "tokens_out": 18,
+        "latency_ms": 4707.644750000327,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "doc-03",
       "context": "postmortem",
       "question": "Why were no duplicate charges issued to customers during the incident?",
       "expected_answer": "The payment client uses idempotency keys on every charge request.",
-      "verdict": "degraded",
+      "verdict": "retained",
       "original": {
         "answer": "The payment client uses idempotency keys on every charge request. This means that even if multiple requests are retried due to connection timeouts or other issues, each request will be processed as a single, unique event, and any previous attempts will not be duplicated. As a result, no duplicate charges were issued to customers during the incident.",
         "tokens_in": 1401,
         "tokens_out": 68,
-        "latency_ms": 16299.343750000844,
+        "latency_ms": 14885.294959007297,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "NOT FOUND.",
-        "tokens_in": 397,
-        "tokens_out": 3,
-        "latency_ms": 3154.5921670003736,
-        "recall": 0.0,
-        "missing_facts": [
-          "idempotency/idempotent"
-        ],
+        "answer": "No duplicate charges were issued because the payment client uses idempotency keys on every charge request.",
+        "tokens_in": 348,
+        "tokens_out": 20,
+        "latency_ms": 278.2265839923639,
+        "recall": 1.0,
+        "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "0/1"
+      }
     },
     {
       "id": "doc-04",
       "context": "postmortem",
       "question": "What is action item A-1 and which team owns it?",
       "expected_answer": "Add an alert on pool_wait_ms p99 above 500 ms, owned by Platform.",
-      "verdict": "degraded",
+      "verdict": "retained",
       "original": {
-        "answer": "Action Item A-1 is to \"Add an alert on `pool_wait_ms` p99 above 500 ms\". The owner of this action item is the Platform team.",
+        "answer": "Action item A-1 is to \"Add an alert on `pool_wait_ms` p99 above 500 ms\" and it is owned by the \"Platform\" team.",
         "tokens_in": 1401,
         "tokens_out": 35,
-        "latency_ms": 11256.342332999338,
+        "latency_ms": 389.35837500321213,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "NOT FOUND. The context does not provide information about action item A-1 or the team that owns it.",
-        "tokens_in": 397,
-        "tokens_out": 22,
-        "latency_ms": 3822.3955829998886,
-        "recall": 0.0,
-        "missing_facts": [
-          "pool_wait_ms",
-          "500",
-          "Platform"
-        ],
+        "answer": "Action item A-1 is to \"Add an alert on `pool_wait_ms` p99 above 500 ms\" and it is owned by the \"Platform\" team.",
+        "tokens_in": 392,
+        "tokens_out": 35,
+        "latency_ms": 409.87866700743325,
+        "recall": 1.0,
+        "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "3/3"
+      }
     },
     {
       "id": "code-01",
@@ -332,84 +404,82 @@
       "expected_answer": "PBKDF2-HMAC-SHA256 with 600,000 iterations.",
       "verdict": "retained",
       "original": {
-        "answer": "PBKDF2-HMAC-SHA256 with 600,000 iterations.",
+        "answer": "The algorithm used to hash passwords is PBKDF2-HMAC-SHA256, with an iteration count of 600,000.",
         "tokens_in": 1952,
-        "tokens_out": 16,
-        "latency_ms": 13907.592042000033,
+        "tokens_out": 27,
+        "latency_ms": 461.92929199605715,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "The PBKDF2-HMAC-SHA256 algorithm with 600,000 iterations is used to hash passwords.",
-        "tokens_in": 508,
-        "tokens_out": 23,
-        "latency_ms": 4454.705791999004,
+        "answer": "The algorithm used to hash passwords is PBKDF2-HMAC-SHA256, with an iteration count of 600,000.",
+        "tokens_in": 504,
+        "tokens_out": 27,
+        "latency_ms": 241.71995800861623,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "code-02",
       "context": "auth_code",
       "question": "How long is an access token valid for, in seconds?",
       "expected_answer": "900 seconds (15 minutes).",
-      "verdict": "degraded",
+      "verdict": "retained",
       "original": {
         "answer": "900",
         "tokens_in": 1952,
         "tokens_out": 1,
-        "latency_ms": 10219.82137500163,
+        "latency_ms": 247.28341698937584,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "NOT FOUND.",
-        "tokens_in": 508,
-        "tokens_out": 3,
-        "latency_ms": 2937.961291998363,
-        "recall": 0.0,
-        "missing_facts": [
-          "900/15 minute/15 min"
-        ],
+        "answer": "900",
+        "tokens_in": 547,
+        "tokens_out": 1,
+        "latency_ms": 173.51329200027976,
+        "recall": 1.0,
+        "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "0/1"
+      }
     },
     {
       "id": "code-03",
       "context": "auth_code",
       "question": "What is the maximum length allowed for a password, and how does it differ from the username limit?",
       "expected_answer": "Passwords may be at most 128 characters; usernames at most 64.",
-      "verdict": "retained",
+      "verdict": "degraded",
       "original": {
-        "answer": "The maximum length allowed for a password is 128 characters. This value is defined in the `validate_password` function:\n\n```python\nif len(password) > 128:\n    raise ValueError(\"password must be at most 128 characters\")\n```\n\nThe maximum length allowed for a username is 64 characters, as defined in the `validate_username` function:\n\n```python\nif len(username) > 64:\n    raise ValueError(\"username must be at most 64 characters\")\n```",
+        "answer": "The maximum length allowed for a password is 128 characters. In contrast, the maximum length allowed for a username is 64 characters, which is half the length of the password limit.",
         "tokens_in": 1952,
-        "tokens_out": 97,
-        "latency_ms": 16829.840540998703,
+        "tokens_out": 37,
+        "latency_ms": 370.8581669925479,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "The maximum length allowed for a password is 128 characters. This value differs from the username limit of 64 characters.",
-        "tokens_in": 508,
-        "tokens_out": 24,
-        "latency_ms": 5026.270082998963,
-        "recall": 1.0,
-        "missing_facts": [],
+        "answer": "NOT FOUND",
+        "tokens_in": 565,
+        "tokens_out": 2,
+        "latency_ms": 163.8996249967022,
+        "recall": 0.0,
+        "missing_facts": [
+          "128",
+          "64"
+        ],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "code-04",
@@ -418,26 +488,25 @@
       "expected_answer": "5 failed attempts, with a 300 second lockout window.",
       "verdict": "retained",
       "original": {
-        "answer": "MAX_FAILED_ATTEMPTS = 5\nLOCKOUT_WINDOW_SECONDS = 300",
+        "answer": "5 failed login attempts trigger a lockout, and the lockout window lasts 300 seconds (5 minutes).",
         "tokens_in": 1952,
-        "tokens_out": 16,
-        "latency_ms": 13293.036916998972,
+        "tokens_out": 22,
+        "latency_ms": 320.21429199085105,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "MAX_FAILED_ATTEMPTS = 5\nLOCKOUT_WINDOW_SECONDS = 300",
-        "tokens_in": 508,
-        "tokens_out": 16,
-        "latency_ms": 4393.513666000217,
+        "answer": "5 failed login attempts trigger a lockout, and the lockout window lasts 300 seconds.",
+        "tokens_in": 536,
+        "tokens_out": 19,
+        "latency_ms": 214.11262500623707,
         "recall": 1.0,
         "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "2/2"
+      }
     },
     {
       "id": "tickets-01",
@@ -446,30 +515,25 @@
       "expected_answer": "Two customers, for orders ORD-551884 and ORD-552088.",
       "verdict": "retained",
       "original": {
-        "answer": "Two customers reported being charged twice:\n\n1. Customer for order ORD-551884\n2. No other customer ID mentioned in the provided context.",
+        "answer": "Two customers reported being charged twice. \n\n1. For order ORD-551884, the customer was charged two identical amounts of $49.90.\n2. For order ORD-552088, the customer was charged $19.10 twice.",
         "tokens_in": 1316,
-        "tokens_out": 29,
-        "latency_ms": 8963.752874999045,
-        "recall": 0.5,
-        "missing_facts": [
-          "ORD-552088/552088"
-        ],
+        "tokens_out": 49,
+        "latency_ms": 1154.699457998504,
+        "recall": 1.0,
+        "missing_facts": [],
         "judge_correct": null,
         "error": null
       },
       "compressed": {
-        "answer": "Two customers were charged twice. The order IDs are:\n\nORD-551203\nORD-551884",
-        "tokens_in": 371,
-        "tokens_out": 20,
-        "latency_ms": 4118.325833002018,
-        "recall": 0.5,
-        "missing_facts": [
-          "ORD-552088/552088"
-        ],
+        "answer": "2 customers reported being charged twice, for order IDs: \n1. ORD-551884\n2. ORD-552088",
+        "tokens_in": 317,
+        "tokens_out": 25,
+        "latency_ms": 248.13529099628795,
+        "recall": 1.0,
+        "missing_facts": [],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "1/2"
+      }
     },
     {
       "id": "tickets-02",
@@ -481,7 +545,7 @@
         "answer": "NOT FOUND.",
         "tokens_in": 1316,
         "tokens_out": 3,
-        "latency_ms": 8882.199709001725,
+        "latency_ms": 8879.021040993393,
         "recall": 0.0,
         "missing_facts": [
           "checkout/payment/pay"
@@ -490,55 +554,17 @@
         "error": null
       },
       "compressed": {
-        "answer": "NOT FOUND.",
-        "tokens_in": 371,
-        "tokens_out": 3,
-        "latency_ms": 2865.180832999613,
+        "answer": "NOT FOUND. The context does not mention any specific problems or issues being reported, only the details of individual customer complaints and requests for assistance with their orders.",
+        "tokens_in": 320,
+        "tokens_out": 31,
+        "latency_ms": 3860.327500005951,
         "recall": 0.0,
         "missing_facts": [
           "checkout/payment/pay"
         ],
         "judge_correct": null,
         "error": null
-      },
-      "facts_present_in_compressed": "1/1"
-    }
-  ],
-  "fact_survival": {
-    "overall": 0.8077,
-    "facts_surviving": 21,
-    "facts_total": 26,
-    "by_context": {
-      "log_incident": {
-        "surviving": 8,
-        "total": 8,
-        "rate": 1.0
-      },
-      "postmortem": {
-        "surviving": 5,
-        "total": 8,
-        "rate": 0.625
-      },
-      "auth_code": {
-        "surviving": 6,
-        "total": 7,
-        "rate": 0.8571
-      },
-      "tickets": {
-        "surviving": 2,
-        "total": 3,
-        "rate": 0.6667
       }
-    },
-    "note": "Deterministic: no model involved. This is the compressor's own ceiling - downstream accuracy is bounded by it."
-  },
-  "diagnostic": {
-    "label": "GPT-4o-mini retrieval diagnostic",
-    "headline_metric": false,
-    "affects_shipped_pipeline": false,
-    "note": "Diagnostic only. The shipped pipeline answers with a local model and requires no API key.",
-    "available": false,
-    "reason": "not run - optional, requires OPENAI_API_KEY with available credits (python -m diagnostic.gpt4o_mini_check)"
-  },
-  "finalized_at": "2026-08-01T10:54:02.514014+00:00"
+    }
+  ]
 }

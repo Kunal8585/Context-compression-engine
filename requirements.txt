@@ -23,18 +23,26 @@ spacy==3.8.14                    # NER / entity density
 # The spaCy pipeline itself is a separate download, see scripts/setup.sh:
 #   python -m spacy download en_core_web_sm
 
-# --- local LLM + evaluation (stages 6, 8) ---
-requests==2.34.2                 # Ollama HTTP API
+# --- model providers (stages 3, 6, 8) ---
+# Every provider - OpenAI, Gemini, Cohere, Groq, OpenRouter, Ollama - is called
+# over its plain HTTP API through engine/providers/. No vendor SDKs: five SDKs
+# would be five dependency trees and five different failure shapes for the
+# fallback chain to normalise, when all of them are a POST with a bearer token.
+requests==2.34.2
 httpx==0.28.1
-openai==2.52.0                   # optional LLM-as-judge; local fallback exists
+openai==2.52.0                   # only diagnostic/gpt4o_mini_check.py still uses this
 
 # --- API + dashboard (stages 9-10) ---
 fastapi==0.141.1
 uvicorn[standard]==0.52.0
-python-multipart==0.0.32
-streamlit==1.60.0
-plotly==6.9.0
-pandas==3.0.5
+python-multipart==0.0.32         # required for the multi-file upload endpoint
+
+# --- multi-file upload: PDF text extraction ---
+# Both, deliberately: they fail differently. pdfplumber has far better layout
+# handling; PyPDF2 is cruder but more tolerant of malformed producers. A PDF
+# that defeats both is a scan with no text layer, and is reported as skipped.
+pdfplumber==0.11.8
+PyPDF2==3.0.1
 
 # --- dev ---
 pytest==9.1.1

@@ -142,7 +142,13 @@ class RedundancyDetector:
     ) -> None:
         self.cfg = cfg or get_config()
         self.tokenizer = tokenizer or get_tokenizer(self.cfg.tokenizer)
-        self.embedder = embedder or EmbeddingModel(self.cfg.redundancy)
+        # Full config, not just `redundancy`: the embedder now resolves a
+        # provider chain and needs to see `providers` to build it.
+        self.embedder = embedder or EmbeddingModel(self.cfg)
+        #: (threshold, was_calibrated) from the most recent embedding pass.
+        self._last_threshold: tuple[float, bool] = (
+            self.cfg.redundancy.similarity_threshold, False
+        )
 
     # -- public API --------------------------------------------------------
     def run(self, chunks: list[Chunk]) -> RedundancyResult:
@@ -206,6 +212,7 @@ class RedundancyDetector:
         metrics.duration_ms = (time.perf_counter() - started) * 1000
         metrics.status = StageStatus.OK
         metrics.note = embedding_note
+        metrics.provider_used = self.embedder.stats.provider
         largest = max(clusters.values(), key=lambda c: c.size, default=None)
         metrics.details = {
             "exact_collapsed": exact_collapsed,
@@ -216,10 +223,19 @@ class RedundancyDetector:
             "largest_cluster_symbol": (
                 _label_for(largest, kept) if largest else None
             ),
-            "similarity_threshold": self.cfg.redundancy.similarity_threshold,
+            "similarity_threshold": self._last_threshold[0],
+            "similarity_threshold_calibrated": self._last_threshold[1],
             "tokens_attributed_to_clusters": accounted,
             "accounting_ok": accounted == removed,
             "protected_chunks": sum(1 for c in kept if c.kind in protected_kinds),
+            # Promoted to the top level because they are now real cost, not
+            # just diagnostics: over an API the embedding pass is N HTTP
+            # requests against a rate limit, where locally it was one matrix
+            # multiply whose only cost was wall-clock on this machine.
+            "embedding_provider": self.embedder.stats.provider,
+            "embedding_api_calls": self.embedder.stats.api_calls,
+            "embedding_latency_ms": round(self.embedder.stats.provider_latency_ms, 2),
+            "embedding_fell_back": self.embedder.stats.fell_back,
             "embedding": self.embedder.stats.to_dict()
             if embeddings is not None
             else {"available": False, "error": self.embedder.load_error},
@@ -323,7 +339,7 @@ class RedundancyDetector:
                 f"exact-hash dedup only",
             )
 
-        threshold = self.cfg.redundancy.similarity_threshold
+        threshold, calibrated = self._threshold_for(self.embedder.stats.provider)
         dimension = vectors.shape[1]
         leaders = np.zeros((len(survivors), dimension), dtype=np.float32)
         leader_chunks: list[Chunk] = []
@@ -356,13 +372,36 @@ class RedundancyDetector:
             leaders[count] = vectors[index]
             leader_chunks.append(chunk)
 
-        note = (
-            f"{skipped_precise} chunks with an exact dedup key were exempt from "
-            f"fuzzy clustering"
-            if skipped_precise
-            else None
-        )
-        return vectors, collapsed, note
+        notes = []
+        if skipped_precise:
+            notes.append(
+                f"{skipped_precise} chunks with an exact dedup key were exempt "
+                f"from fuzzy clustering"
+            )
+        if not calibrated:
+            # Loud, because the failure mode is silent: an uncalibrated
+            # threshold does not error, it just collapses nothing.
+            notes.append(
+                f"similarity threshold {threshold} is not calibrated for "
+                f"'{self.embedder.stats.provider}'; fuzzy dedup may under- or "
+                f"over-collapse (see redundancy.similarity_threshold_by_provider)"
+            )
+        self._last_threshold = (threshold, calibrated)
+        return vectors, collapsed, "; ".join(notes) or None
+
+    def _threshold_for(self, provider: str | None) -> tuple[float, bool]:
+        """Similarity threshold for whichever provider actually embedded.
+
+        Cosine similarity is not comparable across embedding models. Measured
+        on the same 26 near-duplicate support tickets: MiniLM's most similar
+        pair scores 0.908 and Cohere's 0.877, so the 0.88 default that merges
+        7 pairs under MiniLM merges **zero** under Cohere - the fuzzy pass
+        stops working with no error at all. Hence a per-provider map.
+        """
+        overrides = self.cfg.redundancy.similarity_threshold_by_provider
+        if provider and provider in overrides:
+            return overrides[provider], True
+        return self.cfg.redundancy.similarity_threshold, False
 
     # -- bookkeeping -------------------------------------------------------
     @staticmethod
